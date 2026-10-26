@@ -33,14 +33,21 @@ jobs:
       # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (below) runs each Bash command in a
       # bubblewrap sandbox, and Claude Code won't start without it. The
       # runner image doesn't ship it.
-      # Ubuntu 24.04 runners block unprivileged user namespaces through
-      # AppArmor, which bubblewrap needs, so every Bash command would fail.
-      # The preflight runs bwrap once so a broken sandbox fails here, with
-      # its real error, instead of as a review that can't run any command.
-      - name: Install bubblewrap
+      # The env scrub below runs every Bash command in Claude Code's Linux
+      # sandbox, which needs bubblewrap and socat; the runner image ships
+      # neither. Ubuntu 24.04's AppArmor also blocks bwrap from creating user
+      # namespaces, so this adds the profile the sandboxing docs give, which
+      # unconfines bwrap only. Setup as in
+      # https://code.claude.com/docs/en/sandboxing. The preflight runs bwrap
+      # once so a broken sandbox fails here, with its real error, instead of
+      # as a review in which every command fails.
+      - name: Install the Bash sandbox
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
+          printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' \
+            '  include if exists <local/bwrap>' '}' | sudo tee /etc/apparmor.d/bwrap > /dev/null
+          sudo systemctl reload apparmor
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true && echo "bubblewrap works"
 
       - name: Run Claude Code Review
