@@ -33,8 +33,15 @@ jobs:
       # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (below) runs each Bash command in a
       # bubblewrap sandbox, and Claude Code won't start without it. The
       # runner image doesn't ship it.
+      # Ubuntu 24.04 runners block unprivileged user namespaces through
+      # AppArmor, which bubblewrap needs, so every Bash command would fail.
+      # The preflight runs bwrap once so a broken sandbox fails here, with
+      # its real error, instead of as a review that can't run any command.
       - name: Install bubblewrap
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true && echo "bubblewrap works"
 
       - name: Run Claude Code Review
         id: claude-review
