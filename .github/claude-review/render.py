@@ -14,14 +14,15 @@ import sys
 
 owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
 pr, before, after = os.environ["PR_NUMBER"], os.environ.get("BEFORE", ""), os.environ["AFTER"]
-with open(sys.argv[2]) as fh:
+# A file name may not be valid UTF-8; a mangled name beats no review.
+with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
     changed = [line.strip() for line in fh if line.strip()]
 
 if os.environ["MODE"] == "follow-up":
-    situation = (f"It was reviewed before, and new commits were pushed since: its previous head was "
-                 f"{before}. This is a follow-up review of just those commits.")
+    situation = (f"It was reviewed before, and new commits were pushed since: the head of the last "
+                 f"successful review was {before}. This is a follow-up review of just those commits.")
     target = f"{before}..{after}"
-    target_description = "only the commits this push added"
+    target_description = "only the commits added since the last review"
 else:
     situation = ("This is a full review of the whole pull request. There may be threads from earlier "
                  "reviews, for example if its branch was rebased or brought up to date with the base branch.")

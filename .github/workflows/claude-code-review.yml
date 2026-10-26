@@ -10,9 +10,9 @@ on:
     types: [opened, synchronize, ready_for_review, reopened]
 
 # Reviews of one PR queue instead of running at once and posting over each
-# other. GitHub keeps only the newest queued run, so a push whose review was
-# dropped from the queue, or whose review failed, is never reviewed on its
-# own: the next follow-up covers only its own push. Known gap.
+# other. GitHub keeps only the newest queued run, but nothing is lost: a
+# follow-up starts from the head of the last successful review, so it also
+# covers pushes whose review was dropped from the queue or failed.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: false
@@ -31,7 +31,9 @@ jobs:
     # (github_token below), so these permissions bound what its gh and git
     # commands can do: read the code, comment on PRs, never push or merge.
     # They don't allow resolving review threads either, so a person does.
+    # actions: read is for finding the last successful review.
     permissions:
+      actions: read
       contents: read
       pull-requests: write
       issues: read
@@ -39,24 +41,29 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
 
     steps:
-      # The whole history, so the review can diff with git against the base
-      # branch and against the commit a push started from.
+      # The PR's head commit, not the merge commit checkout defaults to, so
+      # line numbers read from the working tree match the lines inline
+      # comments have to target. The whole history, so the review can diff
+      # with git against the base branch and against the last reviewed head.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       # Picks the review and renders .github/claude-review/review.md for it.
-      # A push gets a follow-up of the pushed commits only if the PR still
-      # sits on the same base commit. After "Update branch" or a rebase, the
-      # pushed range would include the base branch's own changes, and after
-      # a force push the old head may not be an ancestor, so those get a full
-      # review, which skips findings that earlier threads already raise.
+      # A push gets a follow-up of the commits since the head of the last
+      # successful review of this branch, so commits whose review failed or
+      # was dropped are still covered. That needs such a review to exist and
+      # the PR to still sit on the same base commit. After "Update branch" or
+      # a rebase, the range would include the base branch's own changes, and
+      # after a force push the old head may not be an ancestor, so those get
+      # a full review, which skips findings that earlier threads already raise.
       - name: Choose the review
         id: plan
         env:
           ACTION: ${{ github.event.action }}
-          BEFORE: ${{ github.event.before }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           AFTER: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,20 +73,24 @@ jobs:
           files="$RUNNER_TEMP/changed-files.txt"
           mode=full
           if [ "$ACTION" = synchronize ]; then
-            if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" "$AFTER" \
+            BEFORE=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/claude-code-review.yml/runs?event=pull_request&status=success&branch=$HEAD_REF&per_page=1" \
+              --jq '.workflow_runs[0].head_sha // empty')
+            if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" "$AFTER" \
                 && [ "$(git merge-base "$BEFORE" "$BASE_REF")" = "$(git merge-base "$AFTER" "$BASE_REF")" ]; then
               mode=follow-up
             else
-              echo "::notice::The push rewrote history or brought in $BASE_REF, so this is a full review."
+              echo "::notice::No earlier successful review, or the push rewrote history or brought in $BASE_REF, so this is a full review."
             fi
           fi
           if [ "$mode" = follow-up ]; then
-            git -c core.quotePath=false diff --name-only "$BEFORE" "$AFTER" > "$files"
+            # -z gives the exact names: without it git quotes and escapes
+            # paths with non-ASCII bytes, quotes, backslashes or control characters
+            git diff -z --name-only "$BEFORE" "$AFTER" | tr '\0' '\n' > "$files"
           else
             # the files API pages through large PRs, where `gh pr diff` gives up
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$files"
           fi
-          prompt=$(MODE=$mode python3 .github/claude-review/render.py .github/claude-review/review.md "$files")
+          prompt=$(MODE=$mode BEFORE=$BEFORE python3 .github/claude-review/render.py .github/claude-review/review.md "$files")
           echo "Review: $mode, $(wc -l < "$files") changed files"
           { echo "prompt<<PROMPT_EOF"; echo "$prompt"; echo "PROMPT_EOF"; } >> "$GITHUB_OUTPUT"
 
