@@ -79,8 +79,11 @@ fixed, and the problem is back. Count it as one only if the thread's latest
 `github-actions` reply says `Addressed in …`, or, in a follow-up review,
 these commits changed the very lines whose earlier change fixed it. A person
 may resolve a thread without a comment because they decided the finding
-doesn't apply, so a later edit near the same code is not enough. Post a
-regression as a new finding that says so and links the earlier thread.
+doesn't apply, so a later edit near the same code is not enough. Even
+then, drop it if a person commented on that thread, after the bot's reply,
+that the finding doesn't apply or the behaviour is deliberate, for example
+when they reverted the fix on purpose. Post a regression as a new finding
+that says so and links the earlier thread.
 
 Post each remaining finding as an inline comment
 on the line it is about in the head commit, with

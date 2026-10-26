@@ -43,9 +43,10 @@ jobs:
     steps:
       # The PR's head commit, not the merge commit checkout defaults to, so
       # line numbers read from the working tree match the lines inline
-      # comments have to target. The prompt and render.py still come from the
-      # merge commit, like this workflow file (see "Choose the review"). The whole history, so the review can diff
-      # with git against the base branch and against the last reviewed head.
+      # comments have to target. The prompt and render.py still come from
+      # the merge commit, like this workflow file (see "Choose the review").
+      # The whole history, so the review can diff with git against the base
+      # branch and against the last reviewed head.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -58,10 +59,11 @@ jobs:
       # dropped are still covered. A run counts only if its claude-review job
       # ran and succeeded: a run whose job was skipped (a draft) can still
       # report success. That needs such a review to exist and the PR to still
-      # sit on the same base commit; if the lookup fails, it's a full review. After "Update branch" or
-      # a rebase, the range would include the base branch's own changes, and
-      # after a force push the old head may not be an ancestor, so those get
-      # a full review, which skips findings that earlier threads already raise.
+      # sit on the same base commit; if the lookup fails, it's a full review.
+      # After "Update branch" or a rebase, the range would include the base
+      # branch's own changes, and after a force push the old head may not be
+      # an ancestor, so those get a full review, which skips findings that
+      # earlier threads already raise.
       - name: Choose the review
         id: plan
         env:
