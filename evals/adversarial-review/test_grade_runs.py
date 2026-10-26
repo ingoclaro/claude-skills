@@ -139,6 +139,36 @@ class GapProven(unittest.TestCase):
         self.assertEqual(g.REDIRECT.findall("x =>\n  m.json; a -> b; v >= 1"), [])
         self.assertEqual(g.REDIRECT.findall("echo hi > /r/m.json 2>&1"), ["/r/m.json"])
 
+    def test_dev_null_is_not_a_mutants_file(self):
+        run = FakeRun(
+            write("/r/m.json", [RULE]),
+            bash("bun test >/dev/null 2>&1; echo ok"),
+            bash("./go.sh 2>/dev/null", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
+    def test_a_comparison_in_a_python_heredoc_is_not_a_redirect(self):
+        run = FakeRun(
+            write("/r/m.json", [RULE]),
+            bash("python3 - <<'EOF'\nif x > 1: pass\nEOF"),
+            bash("./go.sh 1:", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
+    def test_two_files_echoed_on_separate_lines_dont_mix(self):
+        off_rule = dict(OTHER, name="threshold")
+        both = f"echo '{json.dumps([RULE])}' > a.json\necho '{json.dumps([off_rule])}' > b.json"
+        run = FakeRun(bash(both), bash("bun mutate.ts b.json", "SURVIVED    threshold: all tests passed"))
+        self.assertFalse(g.gap_proven(run)[0])
+
+    def test_a_file_name_inside_another_is_not_named(self):
+        run = FakeRun(
+            write("/r/rules.json", [RULE]),
+            write("/r/more-rules.json", [dict(OTHER, name="threshold")]),
+            bash("bun mutate.ts /r/more-rules.json", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertFalse(g.gap_proven(run)[0])
+
     def test_run_through_a_wrapper_that_never_names_the_script(self):
         run = FakeRun(
             write("/r/m.json", [RULE]),

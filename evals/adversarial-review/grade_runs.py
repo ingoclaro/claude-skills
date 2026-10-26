@@ -286,6 +286,8 @@ _DELIM = r"<<-?\s*['\"]?(?P<delim>\w+)['\"]?"
 _BODY = r"[^\n]*\n(?P<body>.*?)\n\s*(?P=delim)\b"
 HEREDOCS = (re.compile(rf"(?:cat|tee)\s*>?\s*{_PATH}\s*{_DELIM}{_BODY}", re.S),
             re.compile(rf"(?:cat|tee)\s*{_DELIM}\s*>\s*{_PATH}{_BODY}", re.S))
+# Any heredoc's body (python3 - <<EOF too), cut before looking for redirects.
+ANY_HEREDOC = re.compile(rf"{_DELIM}{_BODY}", re.S)
 # A shell redirect into a file: a ">" that starts a token (not "=>", "->" or
 # ">="), then a path on the same line.
 REDIRECT = re.compile(r"(?<![-=<>\w])>>?[ \t]*['\"]?([^\s'\"<>;|&=]+)")
@@ -330,19 +332,21 @@ def rule_mutants_by_call(run):
             docs = sorted((m for h in HEREDOCS for m in h.finditer(c)), key=lambda m: m.start())
             for m in docs:
                 files[m["path"]] = m["body"]
-            # Any other redirect (echo, printf) rewrites its exact target with
-            # whatever the command holds; mutant_objects finds the JSON in it.
-            # Heredoc spans are cut first, so a ">=" in a body isn't one.
-            rest = c
-            for m in reversed(docs):
-                rest = rest[:m.start()] + rest[m.end():]
-            targets = REDIRECT.findall(rest)
-            for target in targets:
-                files[target] = c
-            if not docs and not targets:
+            # A redirect (echo, printf) rewrites its exact target with the line
+            # that writes it, but only when that line holds mutants: a
+            # `2>/dev/null` or a stray ">" isn't a mutants file. Every heredoc
+            # body is cut first, so a ">=" in one isn't a redirect.
+            stored = False
+            for line in ANY_HEREDOC.sub("", c).splitlines():
+                if mutant_objects(line):
+                    for target in REDIRECT.findall(line):
+                        files[target] = line
+                        stored = True
+            if not docs and not stored:
                 loose.append(c)
             if "mutate.ts" in c or RESULT_LINE.search(run.outputs.get(t, "")):
-                named = [text for f, text in files.items() if f and os.path.basename(f) in c]
+                named = [text for f, text in files.items()
+                         if f and re.search(rf"(?<![\w.-]){re.escape(os.path.basename(f))}(?![\w.-])", c)]
                 current = set().union(*map(rule_names, named or [*files.values(), *loose]))
         by_call.append(current)
     return by_call
