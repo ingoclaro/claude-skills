@@ -43,8 +43,12 @@ if (!mutantsPath || mutantsPath.startsWith("--")) {
 }
 // The repo copy, once made. Every way out of the script removes it.
 let copyDir: string | undefined;
+// It never throws: a read-only dir a test left in the copy must not turn the
+// results, or fail()'s exit 3, into an uncaught error (exit 1, "a mutant survived").
 const cleanup = () => {
-  if (copyDir) rmSync(copyDir, { recursive: true, force: true });
+  try {
+    if (copyDir) rmSync(copyDir, { recursive: true, force: true });
+  } catch {}
   copyDir = undefined;
 };
 // Anything that stops the script itself exits 3, so it can't be read as exit 1
@@ -102,25 +106,38 @@ const inside = (base: string, path: string) => {
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 };
 
-// A directory is a submodule or a nested repo: left out. A symlink to a path in
-// the repo is recreated relative, so it points into the copy, even when it
-// dangles. Only its directory is resolved, not the link chain: a.ts -> b.ts
-// stays a link to b.ts whatever b.ts is. One that leaves the repo can't be followed from the copy's place:
-// a file it points to is copied, anything else is linked by absolute path.
-// Copies run in batches, so a large repo doesn't run out of file descriptors.
+// What the copy will hold, relative to the root ("" is the root itself), so a
+// link can tell whether its target will be there. A nested repo ends in "/".
+const copied = new Set([""]);
+for (const f of files) if (!f.endsWith("/")) for (let p = f; p !== "."; p = dirname(p)) copied.add(p);
+const inCopy = (path: string) => inside(root, path) && copied.has(relative(root, path));
+
+// A directory is a submodule or a nested repo, and a missing path was deleted
+// but not committed: both left out. A symlink is recreated relative when its
+// target will be in the copy, so it points into the copy (and "" becomes ".",
+// for self -> .). The target is resolved one hop first, with only its
+// directory canonical: a.ts -> b.ts stays a link to b.ts whatever b.ts is.
+// If that hop isn't in the copy (it leaves the repo, or is ignored), the whole
+// chain is followed, and a final target in the copy is linked to. Otherwise
+// a file is copied and anything else linked by absolute path; a dangling link
+// keeps pointing where it did. Copies run in batches, so a large repo doesn't
+// run out of file descriptors.
 async function copyEntry(dir: string, f: string) {
   const src = join(root, f);
   const dst = join(dir, f);
-  const st = await lstat(src);
-  if (st.isDirectory()) return;
+  const st = await lstat(src).catch(() => null);
+  if (!st || st.isDirectory()) return;
   await mkdir(dirname(dst), { recursive: true });
   if (!st.isSymbolicLink()) return copyFile(src, dst);
+  const linkTo = (target: string) => symlink(relative(dirname(src), target) || ".", dst);
   const raw = resolve(dirname(src), await readlink(src));
-  const target = join(await realpath(dirname(raw)).catch(() => dirname(raw)), basename(raw));
-  // "" is a link to its own directory (self -> .)
-  if (inside(root, target)) return symlink(relative(dirname(src), target) || ".", dst);
-  if ((await stat(target).catch(() => null))?.isFile()) return copyFile(target, dst);
-  await symlink(target, dst);
+  const hop = join(await realpath(dirname(raw)).catch(() => dirname(raw)), basename(raw));
+  if (inCopy(hop)) return linkTo(hop);
+  const full = await realpath(raw).catch(() => null);
+  if (!full) return inside(root, hop) ? linkTo(hop) : symlink(hop, dst);
+  if (inCopy(full)) return linkTo(full);
+  if ((await stat(full)).isFile()) return copyFile(full, dst);
+  await symlink(full, dst);
 }
 
 async function copyRepo(): Promise<string> {

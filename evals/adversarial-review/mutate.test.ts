@@ -275,7 +275,84 @@ test("a link to a link out of the repo still points at its neighbour", async () 
   await symlink(join(outside, "impl.ts"), join(dir, "b.ts"));
   await symlink("b.ts", join(dir, "a.ts"));
   await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm links`.cwd(dir);
-  const { out } = await mutate(dir, [{ name: "minus", file: "b.ts", find: "a + b", replace: "a - b" }], "bun test", ["--all"]);
+  const { code, out } = await mutate(dir, [{ name: "minus", file: "b.ts", find: "a + b", replace: "a - b" }], "bun test", ["--all"]);
   expect(out).toMatch(/caught\s+minus/);
+  expect(code).toBe(0);
   expect(await Bun.file(join(outside, "impl.ts")).text()).toBe(add["add.ts"]);
+});
+
+test("a link that leaves the repo and comes back points into the copy", async () => {
+  // lib -> outside/dirlink -> the repo's src: one hop leaves the repo, the
+  // whole chain comes back, so the copy's lib must reach the copy's src.
+  const dir = await repo({
+    "src/add.ts": add["add.ts"],
+    "lib.test.ts": 'import { test, expect } from "bun:test";\nimport { add } from "./lib/add";\ntest("adds", () => expect(add(2, 3)).toBe(5));\n',
+  });
+  const outside = await tempDir();
+  await symlink(join(dir, "src"), join(outside, "dirlink"));
+  await symlink(join(outside, "dirlink"), join(dir, "lib"));
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm lib`.cwd(dir);
+  const { code, out } = await mutate(dir, [{ name: "minus", file: "src/add.ts", find: "a + b", replace: "a - b" }], "bun test", ["--all"]);
+  expect(out).toMatch(/caught\s+minus/);
+  expect(code).toBe(0);
+});
+
+test("a link to an ignored in-repo link is copied from its final target", async () => {
+  // a.ts -> vendor/impl.ts, an ignored link out of the repo: the copy has no
+  // vendor/impl.ts, so a one-hop link would dangle and fail the baseline.
+  const outside = await tempDir();
+  await Bun.write(join(outside, "impl.ts"), "export const one = 1;\n");
+  const dir = await repo(
+    {
+      ...add,
+      "a.test.ts": 'import { test, expect } from "bun:test";\nimport { one } from "./a";\ntest("one", () => expect(one).toBe(1));\n',
+    },
+    "vendor/\n",
+  );
+  await mkdir(join(dir, "vendor"));
+  await symlink(join(outside, "impl.ts"), join(dir, "vendor/impl.ts"));
+  await symlink("vendor/impl.ts", join(dir, "a.ts"));
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm a`.cwd(dir);
+  const { code, out } = await mutate(dir, [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }], "bun test", ["--all"]);
+  expect(out).toMatch(/caught\s+minus/);
+  expect(code).toBe(0);
+});
+
+test("a tracked file deleted in the working tree is left out of the copy", async () => {
+  const dir = await repo({ ...add, "extra.ts": "export {};\n" });
+  await rm(join(dir, "extra.ts"));
+  const { code, out } = await mutate(dir, [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }]);
+  expect(out).toMatch(/caught\s+minus/);
+  expect(code).toBe(0);
+});
+
+test("a copy that can't be removed doesn't change the exit code", async () => {
+  // The suite leaves a read-only directory in the copy, so removing it fails.
+  const dir = await repo(add);
+  const tmp = join(await tempDir(), "copies");
+  await mkdir(tmp);
+  try {
+    const minus = [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }];
+    const { code, out } = await mutate(dir, minus, "mkdir -p ro/x && chmod 555 ro && bun test", ["--all", "--tmp", tmp]);
+    expect(out).toMatch(/caught\s+minus/);
+    expect(code).toBe(0);
+  } finally {
+    await $`chmod -R u+w ${tmp}`.nothrow().quiet();
+  }
+});
+
+test("a copy that fails partway is removed", async () => {
+  // An unreadable tracked file stops the copy after mkdtemp made the dir.
+  const dir = await repo({ ...add, "secret.ts": "export {};\n" });
+  await $`chmod 000 secret.ts`.cwd(dir);
+  const tmp = join(await tempDir(), "copies");
+  await mkdir(tmp);
+  try {
+    const { code, out } = await mutate(dir, [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }], "bun test", ["--tmp", tmp]);
+    expect(code).toBe(3);
+    expect(out).toContain("copying the repo");
+    expect(await readdir(tmp)).toEqual([]);
+  } finally {
+    await $`chmod 644 secret.ts`.cwd(dir);
+  }
 });

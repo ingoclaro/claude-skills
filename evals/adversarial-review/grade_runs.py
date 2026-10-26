@@ -27,7 +27,9 @@ eval viewer.
 
 Usage: python3 grade_runs.py <iteration-dir>
 """
+import functools
 import json
+import os
 import re
 import subprocess
 import sys
@@ -277,22 +279,35 @@ def mutant_objects(text):
     return objs
 
 
+# A heredoc that writes a file: `cat > path <<'EOF'` ... EOF.
+HEREDOC = re.compile(r"(?:cat|tee)\s*>?\s*['\"]?([^\s'\"<>;|&]+)['\"]?\s*<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\2\b", re.S)
+# A line of mutate.ts results, which marks a call that ran it, however it was named.
+RESULT_LINE = re.compile(r"^(SURVIVED|caught|NOT APPLIED|TIMEOUT)\s+\S", re.M)
+# Tools whose output can carry a background mutate.ts run's results.
+OUTPUT_TOOLS = ("Bash", "BashOutput", "TaskOutput")
+
+
+@functools.lru_cache(maxsize=None)
+def rule_names(text):
+    """Names of the mutants in a text whose "find" is in the rollover rule."""
+    return frozenset(m["name"] for m in mutant_objects(text)
+                     if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", ""))))
+
+
 def rule_mutants_by_call(run):
     """For each tool call, the rollover-rule mutants of the last mutate.ts run so far.
 
-    A rule mutant is one whose "find" is in the rule. The mutants are read as
-    they stood when mutate.ts ran, so a mutants file rewritten for a rerun
-    doesn't lose a survivor from the first run, and a "find" edited off the
-    rule afterwards still counted for the run that used it. Files are followed
-    through Write and Edit; an Edit to a file Write never made is read on its
-    own, and Bash commands as written. Before any mutate.ts run, None.
+    A run is a Bash call that names mutate.ts or prints its result lines (a
+    script in a variable or a wrapper still prints them). Its mutants are the
+    files the command names, as they stood then: Write and Edit are followed,
+    and so are heredocs. So a mutants file rewritten for a rerun doesn't lose a
+    survivor from the first run, a "find" edited off the rule afterwards still
+    counted for the run that used it, and two files reusing a name don't mix.
+    A command that names no known file falls back to everything written so far,
+    Bash commands and Edits to unknown files included. Before any run, None.
     """
-    def names(texts):
-        return {m["name"] for t in texts for m in mutant_objects(t)
-                if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", "")))}
-
-    files, texts, current, by_call = {}, [], None, []
-    for n, i, _ in run.tools:
+    files, loose, current, by_call = {}, [], None, []
+    for (n, i, _), t in zip(run.tools, run.ids):
         path = i.get("file_path")
         if n == "Write":
             files[path] = i.get("content", "")
@@ -300,11 +315,17 @@ def rule_mutants_by_call(run):
             files[path] = files[path].replace(i.get("old_string", ""), i.get("new_string", ""),
                                               -1 if i.get("replace_all") else 1)
         elif n == "Edit":
-            texts.append(i.get("new_string", ""))
+            loose.append(i.get("new_string", ""))
         elif n == "Bash":
-            texts.append(i.get("command", ""))
-            if "mutate.ts" in i.get("command", ""):
-                current = names([*files.values(), *texts])
+            c = i.get("command", "")
+            docs = HEREDOC.findall(c)
+            for target, _, body in docs:
+                files[target] = body
+            if not docs:
+                loose.append(c)
+            if "mutate.ts" in c or RESULT_LINE.search(run.outputs.get(t, "")):
+                named = [text for f, text in files.items() if f and os.path.basename(f) in c]
+                current = set().union(*map(rule_names, named or [*files.values(), *loose]))
         by_call.append(current)
     return by_call
 
@@ -316,7 +337,7 @@ def gap_proven(run):
     # hand: editing the rule and running the suite green.
     by_call = rule_mutants_by_call(run)
     for (n, i, _), t, rule in zip(run.tools, run.ids, by_call):
-        if n != "Bash" or not rule:
+        if n not in OUTPUT_TOOLS or not rule:
             continue
         for line in run.outputs.get(t, "").splitlines():
             m = re.match(r"SURVIVED\s+(.*)", line)

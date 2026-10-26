@@ -1,6 +1,7 @@
 # adversarial-review evals
 
-Two suites, for the two parts of the skill that can fail independently:
+Two suites, for the two parts of the skill that can fail independently, plus
+unit tests for the grader:
 
 - **Behaviour** (`run_evals.py`, `grade_runs.py`): given a commit with a known
   bug planted in it, does a run of the skill find the bug, prove it, name the
@@ -9,6 +10,8 @@ Two suites, for the two parts of the skill that can fail independently:
 - **Mutation script** (`mutate.test.ts`): unit tests for
   `skills/adversarial-review/scripts/mutate.ts`, which the reviewer runs on
   every review. They're cheap and deterministic, so run them after any change to the script.
+- **Grader** (`test_grade_runs.py`): unit tests for how `grade_runs.py` reads
+  a transcript, since a parsing bug there reads as a skill failure.
 
 Stdlib Python, bash and bun only. No API key beyond the `claude` CLI's own auth.
 
@@ -175,3 +178,13 @@ Before reading a delta, check the denials in `grading.json`'s
 ```bash
 bun test mutate.test.ts      # TMPDIR=<writable dir> if /tmp is blocked
 ```
+
+## Grader tests
+
+```bash
+python3 -m unittest test_grade_runs
+```
+
+They feed the transcript checks hand-built tool calls (mutants files written,
+reruns, wrappers, background runs), so run them after any change to how
+`grade_runs.py` reads a transcript.
