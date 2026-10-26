@@ -247,46 +247,48 @@ RULE_FIND = r"1023\.95|unit > 0|unit\+\+;\s*\}\s*return"
 
 def mutant_objects(text):
     """The mutant objects in a mutants file, or in a command that writes one."""
-    # The whole text, then the span from the first "[" to the last "]": a
-    # heredoc or echo around the JSON.
-    for cand in (text, *re.findall(r"\[[\s\S]*\]", text)):
+    # The first JSON array of objects starting at any "[": a heredoc or echo
+    # around the JSON, or a `[ -d x ]` test before it, is skipped over.
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"\[", text or ""):
         try:
-            objs = json.loads(cand)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        return [o for o in (objs if isinstance(objs, list) else [objs]) if isinstance(o, dict)]
-    # Not valid JSON as a whole: its flat objects.
-    objs = []
-    for m in re.finditer(r"\{[^{}]*\}", text):
-        try:
-            objs.append(json.loads(m.group(0)))
+            objs, _ = decoder.raw_decode(text, m.start())
         except json.JSONDecodeError:
-            pass
+            continue
+        if isinstance(objs, list) and objs and all(isinstance(o, dict) for o in objs):
+            return objs
+    # No array: the objects on their own, as an Edit that adds one has them.
+    objs, pos = [], 0
+    while (start := (text or "").find("{", pos)) != -1:
+        try:
+            obj, pos = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                objs.append(obj)
+        except json.JSONDecodeError:
+            pos = start + 1
     return objs
 
 
 def rule_mutants(run):
     """Names of the mutants written for mutate.ts whose "find" is in the rollover rule.
 
-    Mutants files are followed through Write and Edit, so an edited file is
-    read as it stands after the edit; Bash commands are read as written.
+    A mutants file written with Write is read as it stands after its last Edit;
+    an Edit to a file Write never made is read on its own, and Bash commands as
+    written.
     """
     files, texts = {}, []
     for n, i, _ in run.tools:
+        path = i.get("file_path")
         if n == "Write":
-            files[i.get("file_path")] = i.get("content", "")
-            texts.append(files[i.get("file_path")])
+            files[path] = i.get("content", "")
+        elif n == "Edit" and path in files:
+            files[path] = files[path].replace(i.get("old_string", ""), i.get("new_string", ""),
+                                              -1 if i.get("replace_all") else 1)
         elif n == "Edit":
-            path = i.get("file_path")
-            old, new = i.get("old_string", ""), i.get("new_string", "")
-            if path in files:
-                files[path] = files[path].replace(old, new, -1 if i.get("replace_all") else 1)
-                texts.append(files[path])
-            else:
-                texts.append(new)
+            texts.append(i.get("new_string", ""))
         elif n == "Bash":
             texts.append(i.get("command", ""))
-    return {m["name"] for t in texts for m in mutant_objects(t)
+    return {m["name"] for t in [*files.values(), *texts] for m in mutant_objects(t)
             if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", "")))}
 
 

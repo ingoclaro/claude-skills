@@ -24,7 +24,7 @@
 import { $ } from "bun";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { rmSync } from "node:fs";
 import { mkdtemp, mkdir, rm, symlink, copyFile, lstat, readlink, realpath, stat } from "node:fs/promises";
 
@@ -55,7 +55,7 @@ if (!(timeoutSec > 0 && timeoutSec <= 2147483))
 const tmpRoot = flag("--tmp", tmpdir());
 const mutants: Mutant[] = await Bun.file(mutantsPath).json().catch((e) => fail(`reading ${mutantsPath}`, e));
 if (!Array.isArray(mutants)) fail(`reading ${mutantsPath}`, "expected a JSON array of mutants");
-const root = (await $`git rev-parse --show-toplevel`.quiet().text().catch((e) => fail("finding the repo root", e))).trim();
+const root = await realpath((await $`git rev-parse --show-toplevel`.quiet().text().catch((e) => fail("finding the repo root", e))).trim());
 
 // The tests added or changed in HEAD: the new tests are what the review is checking.
 const testFile = /\.(test|spec)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.py$/;
@@ -71,39 +71,6 @@ console.log(changedTests.length ? `Tests changed in HEAD: ${changedTests.join(",
 const files = (await $`git -C ${root} ls-files -co --exclude-standard -z`.quiet().text().catch((e) => fail("listing the repo's files", e)))
   .split("\0")
   .filter(Boolean);
-
-const inside = (base: string, path: string) => {
-  const rel = relative(base, path);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
-};
-
-// A directory is a submodule or a nested repo: left out. A symlink to a path in
-// the repo is recreated relative, so it points into the copy, even when it
-// dangles. One that leaves the repo can't be followed from the copy's place:
-// a file it points to is copied, anything else is linked by absolute path.
-// Copies run in batches, so a large repo doesn't run out of file descriptors.
-async function copyEntry(dir: string, f: string) {
-  const src = join(root, f);
-  const dst = join(dir, f);
-  const st = await lstat(src);
-  if (st.isDirectory()) return;
-  await mkdir(dirname(dst), { recursive: true });
-  if (!st.isSymbolicLink()) return copyFile(src, dst);
-  const target = resolve(dirname(src), await readlink(src));
-  if (inside(root, target)) return symlink(relative(dirname(src), target), dst);
-  if ((await stat(target).catch(() => null))?.isFile()) return copyFile(target, dst);
-  await symlink(target, dst);
-}
-
-async function copyRepo(): Promise<string> {
-  // Some sandboxes let mkdtemp "succeed" in a dir they then hide, so prove the copy is readable.
-  const dir = await mkdtemp(join(tmpRoot, "mutant-"))
-    .then(async (d) => (await Bun.write(join(d, ".probe"), "ok"), (await Bun.file(join(d, ".probe")).text()) === "ok" ? d : Promise.reject("not readable back")))
-    .catch((e) => fail(`using a temp dir under ${tmpRoot} (pass a writable --tmp)`, e));
-  for (let i = 0; i < files.length; i += 64) await Promise.all(files.slice(i, i + 64).map((f) => copyEntry(dir, f)));
-  await symlink(join(root, "node_modules"), join(dir, "node_modules")).catch(() => {});
-  return dir;
-}
 
 // The copy and the running test group, for the interrupt handler below.
 let copyDir: string | undefined;
@@ -121,6 +88,44 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
     if (copyDir) rmSync(copyDir, { recursive: true, force: true });
     process.exit(3);
   });
+
+// Both paths canonical (realpath), so /tmp and /private/tmp can't disagree.
+// The base itself counts as inside; "..config" is a name, not a parent.
+const inside = (base: string, path: string) => {
+  const rel = relative(base, path);
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+};
+
+// A directory is a submodule or a nested repo: left out. A symlink to a path in
+// the repo is recreated relative, so it points into the copy, even when it
+// dangles. One that leaves the repo can't be followed from the copy's place:
+// a file it points to is copied, anything else is linked by absolute path.
+// Copies run in batches, so a large repo doesn't run out of file descriptors.
+async function copyEntry(dir: string, f: string) {
+  const src = join(root, f);
+  const dst = join(dir, f);
+  const st = await lstat(src);
+  if (st.isDirectory()) return;
+  await mkdir(dirname(dst), { recursive: true });
+  if (!st.isSymbolicLink()) return copyFile(src, dst);
+  const raw = resolve(dirname(src), await readlink(src));
+  const target = await realpath(raw).catch(() => raw); // a dangling link keeps its own path
+  if (inside(root, target)) return symlink(relative(dirname(src), target), dst);
+  if ((await stat(target).catch(() => null))?.isFile()) return copyFile(target, dst);
+  await symlink(target, dst);
+}
+
+async function copyRepo(): Promise<string> {
+  // Some sandboxes let mkdtemp "succeed" in a dir they then hide, so prove the copy is readable.
+  const dir = await mkdtemp(join(tmpRoot, "mutant-"))
+    .then(realpath)
+    .then(async (d) => (await Bun.write(join(d, ".probe"), "ok"), (await Bun.file(join(d, ".probe")).text()) === "ok" ? d : Promise.reject("not readable back")))
+    .catch((e) => fail(`using a temp dir under ${tmpRoot} (pass a writable --tmp)`, e));
+  copyDir = dir; // from here on an interrupt removes it
+  for (let i = 0; i < files.length; i += 64) await Promise.all(files.slice(i, i + 64).map((f) => copyEntry(dir, f)));
+  await symlink(join(root, "node_modules"), join(dir, "node_modules")).catch(() => {});
+  return dir;
+}
 
 // The test command runs in its own process group, and a timeout kills the
 // whole group: killing only `sh` would leave the runner holding the pipes open.
@@ -158,10 +163,10 @@ async function run(m: Mutant, dir: string): Promise<Result> {
   if (source === null) return { name, outcome: "NOT APPLIED", detail: `no such file: ${m.file}` };
   const count = source.split(m.find).length - 1;
   if (count !== 1) return { name, outcome: "NOT APPLIED", detail: `"find" matched ${count} times in ${m.file}` };
-  // Behind a symlink out of the repo, writing the mutant would change the real file.
   const real = await realpath(join(dir, m.file)).catch(() => null);
-  if (!real || !inside(await realpath(dir), real))
-    return { name, outcome: "NOT APPLIED", detail: `${m.file} is behind a symlink out of the repo` };
+  if (!real) return { name, outcome: "NOT APPLIED", detail: `${m.file} is not in the copy (ignored, or in a submodule or nested repo)` };
+  // Behind a symlink out of the repo, writing the mutant would change the real file.
+  if (!inside(dir, real)) return { name, outcome: "NOT APPLIED", detail: `${m.file} is behind a symlink out of the repo` };
   try {
     // A function, so "$&" or "$$" in the replace text is written as is.
     await Bun.write(join(dir, m.file), source.replace(m.find, () => m.replace));
@@ -177,8 +182,7 @@ async function run(m: Mutant, dir: string): Promise<Result> {
 }
 
 // One copy, mutants run one at a time.
-const dir = await copyRepo().catch((e) => fail("copying the repo", e));
-copyDir = dir;
+const dir = await copyRepo().catch((e) => (copyDir && rmSync(copyDir, { recursive: true, force: true }), fail("copying the repo", e)));
 const results: Result[] = [];
 let crashed: unknown;
 try {

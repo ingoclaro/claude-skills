@@ -207,10 +207,49 @@ test("an interrupt kills the running tests and removes the copy", async () => {
   const marker = `sleep ${3000 + Math.floor(Math.random() * 1000)}`;
   const proc = Bun.spawn(["bun", script, json, "--cmd", marker, "--all", "--tmp", tmp], { cwd: dir, stdout: "ignore", stderr: "ignore" });
   await Bun.sleep(1500);
-  expect((await $`pgrep -f ${marker}`.nothrow().quiet()).exitCode).toBe(0); // the baseline is running
+  // the baseline's sh, not this script, whose own argv has the marker too
+  expect((await $`pgrep -f ${`^sh -c ${marker}`}`.nothrow().quiet()).exitCode).toBe(0);
   proc.kill("SIGTERM");
   expect(await proc.exited).toBe(3);
   await Bun.sleep(200);
   expect((await $`pgrep -f ${marker}`.nothrow().quiet()).exitCode).toBe(1);
   expect(await readdir(tmp)).toEqual([]);
+});
+
+test("a link into the repo by another path points into the copy", async () => {
+  // alias/add.ts is add.ts reached through a link to the repo: copied as a
+  // plain file, the only test would read the unmutated original.
+  const dir = await repo({
+    "add.ts": add["add.ts"],
+    "via.test.ts": 'import { test, expect } from "bun:test";\nimport { add } from "./via";\ntest("via", () => expect(add(2, 3)).toBe(5));\n',
+  });
+  const alias = join(await tempDir(), "alias");
+  await symlink(dir, alias);
+  await symlink(join(alias, "add.ts"), join(dir, "via.ts"));
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm via`.cwd(dir);
+  const { out } = await mutate(dir, [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }]);
+  expect(out).toMatch(/caught\s+minus/);
+});
+
+test("a file the copy doesn't have is reported as missing, and a ..name is in the repo", async () => {
+  const dir = await repo(
+    {
+      ...add,
+      "..config/flags.ts": "export const on = true;\n",
+      "flags.test.ts": 'import { test, expect } from "bun:test";\nimport { on } from "./..config/flags";\ntest("on", () => expect(on).toBe(true));\n',
+    },
+    "gen.ts\n",
+  );
+  await Bun.write(join(dir, "gen.ts"), "export const g = 1;\n");
+  const { out } = await mutate(
+    dir,
+    [
+      { name: "ignored", file: "gen.ts", find: "= 1", replace: "= 2" },
+      { name: "dots", file: "..config/flags.ts", find: "true", replace: "false" },
+    ],
+    "bun test",
+    ["--all"],
+  );
+  expect(out).toMatch(/NOT APPLIED\s+ignored: gen.ts is not in the copy/);
+  expect(out).toMatch(/caught\s+dots/);
 });
