@@ -1,0 +1,124 @@
+{
+  "skill_name": "adversarial-review",
+  "executor_model": "claude-sonnet-5-5",
+  "notes": "Runs are headless `claude -p --output-format stream-json --verbose` sessions inside a fresh copy of each fixture repo (setup_fixtures.sh). Agent-tool subagents can't be the executor: the skill itself dispatches a background Opus reviewer, which calls /code-review. with_skill sends `prompt` (the slash command); without_skill sends `baseline_prompt`, the same request in plain words, with the Skill tool disallowed. Each run gets its own TMPDIR under the run dir, passed with --add-dir, since sandboxes often block /tmp. Every assertion is checked by grade_runs.py against the fixture's planted ground truth, the run's repo state and its transcript; `check` names the function that grades it.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "planted-bug",
+      "fixture": "planted-bug",
+      "prompt": "/adversarial-review page bounds\n\nSpec: paginate(items, page, size) returns 1-based pages; the last page holds the leftovers, and an empty list has a single empty page. Test command: bun test",
+      "baseline_prompt": "Do an adversarial review of my last commit: try to break it, focusing on page bounds.\n\nSpec: paginate(items, page, size) returns 1-based pages; the last page holds the leftovers, and an empty list has a single empty page. Test command: bun test",
+      "assertions": [
+        {
+          "check": "reports_floor_bug",
+          "text": "The review reports that the page count rounds down, so the last partial page can't be reached"
+        },
+        {
+          "check": "reports_empty_bug",
+          "text": "The review reports that an empty list has no valid page (paginate([], 1, n) throws)"
+        },
+        {
+          "check": "bug_demonstrated",
+          "text": "A bug was demonstrated by running code other than the test suite (a repro script or bun -e)"
+        },
+        {
+          "check": "reports_test_gap",
+          "text": "The review names a test gap: the commit's tests never reach the last page or the upper page bound"
+        },
+        {
+          "check": "repo_untouched",
+          "text": "The commit under review and the working tree are unchanged: nothing was fixed before the user chose"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "agreed-decision",
+      "fixture": "agreed-decision",
+      "prompt": "/adversarial-review input parsing\n\nSpec: parseDuration turns strings like \"1h30m\" or \"250ms\" into milliseconds and throws on anything it can't parse. Agreed decision: a bare number like \"90\" means seconds, not milliseconds. That's deliberate, to match the old config files. Test command: bun test",
+      "baseline_prompt": "Do an adversarial review of my last commit: try to break it, focusing on input parsing.\n\nSpec: parseDuration turns strings like \"1h30m\" or \"250ms\" into milliseconds and throws on anything it can't parse. Agreed decision: a bare number like \"90\" means seconds, not milliseconds. That's deliberate, to match the old config files. Test command: bun test",
+      "assertions": [
+        {
+          "check": "reports_validation_bug",
+          "text": "The review reports that malformed input is accepted instead of throwing (e.g. \"5x\" gives 0, \"1.5h\" gives 5h)"
+        },
+        {
+          "check": "agreed_decision_not_reported",
+          "text": "Bare numbers meaning seconds is not reported as an issue: every mention of it is dismissed or acknowledged as agreed"
+        },
+        {
+          "check": "bug_demonstrated",
+          "text": "A bug was demonstrated by running code other than the test suite (a repro script or bun -e)"
+        },
+        {
+          "check": "repo_untouched",
+          "text": "The commit under review and the working tree are unchanged: nothing was fixed before the user chose"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "dirty-tree",
+      "fixture": "dirty-tree",
+      "prompt": "/adversarial-review page bounds\n\nSpec: paginate(items, page, size) returns 1-based pages; the last page holds the leftovers, and an empty list has a single empty page. Test command: bun test",
+      "baseline_prompt": "Do an adversarial review of my last commit: try to break it, focusing on page bounds.\n\nSpec: paginate(items, page, size) returns 1-based pages; the last page holds the leftovers, and an empty list has a single empty page. Test command: bun test",
+      "assertions": [
+        {
+          "check": "asks_commit_or_stash",
+          "text": "The run points out the uncommitted changes and asks for them to be committed or stashed first"
+        },
+        {
+          "check": "no_reviewer_dispatched",
+          "text": "No review subagent is started while the tree is dirty"
+        },
+        {
+          "check": "user_changes_preserved",
+          "text": "The uncommitted edit and the untracked file are left exactly as they were, and HEAD is unchanged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "cache-aliasing",
+      "fixture": "cache-aliasing",
+      "prompt": "/adversarial-review caching\n\nSpec: parseFlags runs on every request with a handful of distinct strings, so this commit caches its result. Nothing else should change. Test command: bun test",
+      "baseline_prompt": "Do an adversarial review of my last commit: try to break it, focusing on caching.\n\nSpec: parseFlags runs on every request with a handful of distinct strings, so this commit caches its result. Nothing else should change. Test command: bun test",
+      "assertions": [
+        {
+          "check": "reports_cache_aliasing",
+          "text": "The review reports that callers share the cached array, so effectiveFlags() pushing defaults into it leaks flags between users"
+        },
+        {
+          "check": "bug_demonstrated",
+          "text": "A bug was demonstrated by running code other than the test suite (a repro script or bun -e)"
+        },
+        {
+          "check": "repo_untouched",
+          "text": "The commit under review and the working tree are unchanged: nothing was fixed before the user chose"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "weak-tests",
+      "fixture": "weak-tests",
+      "prompt": "/adversarial-review test coverage\n\nSpec: formatBytes(bytes) formats byte counts for the UI, as its comment describes. The tests in this commit are meant to cover every rule in that comment. Test command: bun test",
+      "baseline_prompt": "Do an adversarial review of my last commit: try to break it, focusing on test coverage.\n\nSpec: formatBytes(bytes) formats byte counts for the UI, as its comment describes. The tests in this commit are meant to cover every rule in that comment. Test command: bun test",
+      "assertions": [
+        {
+          "check": "names_rollover_gap",
+          "text": "The review names the specific gap: no test reaches the round-up-to-the-next-unit rule (a value that would show as \"1024.0 KB\" becomes \"1.0 MB\")"
+        },
+        {
+          "check": "gap_proven",
+          "text": "The gap is shown by running something: a mutant that breaks the rollover rule survives the commit's tests"
+        },
+        {
+          "check": "repo_untouched",
+          "text": "The commit under review and the working tree are unchanged: nothing was fixed before the user chose"
+        }
+      ]
+    }
+  ]
+}
