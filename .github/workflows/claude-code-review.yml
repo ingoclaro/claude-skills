@@ -74,7 +74,7 @@ jobs:
             fi
           fi
           if [ "$mode" = follow-up ]; then
-            git diff --name-only "$BEFORE" "$AFTER" > "$files"
+            git -c core.quotePath=false diff --name-only "$BEFORE" "$AFTER" > "$files"
           else
             # the files API pages through large PRs, where `gh pr diff` gives up
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$files"
