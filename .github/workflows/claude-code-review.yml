@@ -3,20 +3,27 @@ name: Claude Code Review
 on:
   pull_request:
     # Not on every push (synchronize): each review is a full one, so later
-    # pushes would each cost another. Comment `@claude review this PR` to
-    # get a review after changes.
+    # pushes would each cost another. To review a PR again after changes, run
+    # this workflow by hand: Actions > Claude Code Review > Run workflow, or
+    # `gh workflow run claude-code-review.yml -f pr_number=<n>`.
     types: [opened, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the pull request to review
+        required: true
+        type: number
 
 jobs:
   claude-review:
-    # Only review PRs opened by maintainers, so external PRs don't spend tokens
-    if: contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+    # Only review maintainers' PRs, so external PRs don't spend tokens or
+    # reach a review that may run any Bash command. Skip drafts: they're
+    # reviewed when marked ready. A manual run has no PR event to check
+    # here, so its first step checks the same things.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+       !github.event.pull_request.draft)
 
     runs-on: ubuntu-latest
     # The job's GITHUB_TOKEN is the only GitHub credential the review gets
@@ -26,16 +33,33 @@ jobs:
       contents: read
       pull-requests: write
       issues: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
 
     steps:
+      - name: Check the pull request can be reviewed
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '"\(.state) \(.draft) \(.author_association)"' | {
+            read -r state draft association
+            case "$state $draft $association" in
+              "open false OWNER" | "open false MEMBER" | "open false COLLABORATOR") ;;
+              *) echo "::error::PR #$PR_NUMBER is $state, draft=$draft, by $association: only open, non-draft PRs by maintainers are reviewed."; exit 1 ;;
+            esac
+          }
+
+      # The whole history, so the review can diff against the base branch
+      # with git; with a shallow clone `git diff main...HEAD` fails. A manual
+      # run checks out the PR's merge commit, as a pull_request event does.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr_number) || '' }}
 
-      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (below) runs each Bash command in a
-      # bubblewrap sandbox, and Claude Code won't start without it. The
-      # runner image doesn't ship it.
       # The env scrub below runs every Bash command in Claude Code's Linux
       # sandbox, which needs bubblewrap and socat; the runner image ships
       # neither. Ubuntu 24.04's AppArmor also blocks bwrap from creating user
@@ -75,7 +99,7 @@ jobs:
           # max: broader), where the plugin only ever reported bugs that fail
           # regardless of input. --comment posts the findings inline.
           # https://code.claude.com/docs/en/code-review-local
-          prompt: '/code-review high --comment ${{ github.event.pull_request.number }}'
+          prompt: '/code-review high --comment ${{ env.PR_NUMBER }}'
           # Nothing can approve a permission prompt here, so a denied tool call
           # just fails. Bash is off by default, and the model chains commands
           # (`gh pr diff > f; grep ...`, `gh api`, `git ls-files | grep`) that
@@ -94,17 +118,15 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
-      # A review's comment reads the same whether it read the whole diff or
-      # two files, so check the transcript: a posted review fails this step
-      # if any changed file never reached it.
+      # A review reads the same whether it covered the whole diff or two
+      # files, and with no findings it posts nothing at all, so check the
+      # transcript: this fails if any changed file never reached the review.
       - name: Check the review saw every changed file
         if: always() && steps.claude-review.outputs.execution_file != ''
         env:
           EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           # the files API pages through large PRs, where `gh pr diff` gives up
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$RUNNER_TEMP/changed-files.txt"
           python3 .github/scripts/review_coverage.py "$EXECUTION_FILE" "$RUNNER_TEMP/changed-files.txt"
-

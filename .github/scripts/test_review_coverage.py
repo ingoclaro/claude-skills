@@ -108,8 +108,16 @@ class Posting(unittest.TestCase):
         code, out = run(messages, list(changed))
         return code, out.splitlines()[0]
 
-    def test_nothing_posted_is_a_notice_not_a_failure(self):
-        self.assertEqual(self.verdict(self.full_diff), (0, "nothing posted"))
+    def test_a_clean_review_that_saw_everything_passes_without_posting(self):
+        self.assertEqual(self.verdict(self.full_diff, ["a.py"]),
+                         (0, "nothing posted, all 1 changed files reached the review"))
+
+    def test_a_shallow_review_that_posts_nothing_still_fails(self):
+        # the bundled /code-review posts nothing when it finds nothing, so
+        # silence can hide a shallow review
+        code, line = self.verdict(self.full_diff)
+        self.assertEqual(code, 1)
+        self.assertEqual(line, "nothing posted, but 1 of 2 changed files never reached the review")
 
     def test_shallow_review_that_posts_fails(self):
         code, line = self.verdict(self.full_diff + POST)
@@ -118,15 +126,16 @@ class Posting(unittest.TestCase):
 
     def test_denied_post_does_not_count_as_posted(self):
         denied = bash("p", "gh pr comment 7 --body x", "This command requires approval", error=True)
-        self.assertEqual(self.verdict(self.full_diff + denied), (0, "nothing posted"))
+        self.assertEqual(self.verdict(self.full_diff + denied, ["a.py"])[1],
+                         "nothing posted, all 1 changed files reached the review")
 
     def test_gh_api_post_counts_as_posted(self):
         api = bash("p", "gh api repos/o/r/issues/7/comments -f body=x")
-        self.assertEqual(self.verdict(self.full_diff + api)[0], 1)
+        self.assertTrue(self.verdict(self.full_diff + api, ["a.py"])[1].startswith("posted"))
 
     def test_gh_api_read_of_comments_is_not_a_post(self):
         api = bash("p", "gh api repos/o/r/issues/7/comments --jq '.[].body'")
-        self.assertEqual(self.verdict(self.full_diff + api), (0, "nothing posted"))
+        self.assertTrue(self.verdict(self.full_diff + api, ["a.py"])[1].startswith("nothing posted"))
 
     def test_failed_bash_calls_are_counted(self):
         broken = bash("a", "gh pr view 7", "bwrap: setting up uid map: Permission denied", error=True)
@@ -142,7 +151,7 @@ class Posting(unittest.TestCase):
 
     def test_inline_comment_counts_as_posted(self):
         inline = call("i", "mcp__github_inline_comment__create_inline_comment", {"path": "a.py"})
-        self.assertEqual(self.verdict(self.full_diff + inline)[0], 1)
+        self.assertTrue(self.verdict(self.full_diff + inline, ["a.py"])[1].startswith("posted"))
 
 
 if __name__ == "__main__":

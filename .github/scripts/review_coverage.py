@@ -23,11 +23,13 @@ it doesn't count.
 
 A file name alone, as in `gh pr view --json files`, doesn't count.
 
-Rule: if the run posted anything (`gh pr comment`, a comment or review made
-through `gh api`, or an inline comment) and the call succeeded, every changed
-file must have reached the review, or this exits 1 and names the files it
-never saw. A run that posted nothing (no findings to post, or a review that
-stopped early) published no verdict, so it only gets a notice.
+Rule: every changed file must have reached the review, or this exits 1 and
+names the files it never saw. That holds whether or not the review posted:
+the bundled /code-review posts nothing when it finds nothing, so "nothing
+posted" can just as well be a clean review as a shallow one. Whether it
+posted (`gh pr comment`, a comment or review made through `gh api`, or an
+inline comment, counted only when the call succeeded) is reported, not
+judged.
 
 Prints counts, model names, file paths and the first line of up to three
 distinct Bash errors (token-shaped text redacted), never other transcript
@@ -122,12 +124,11 @@ def main():
     missed = [f for f in changed if f not in seen]
 
     result = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("type") == "result"), {})
-    if not posted:
-        verdict = "nothing posted"
-    elif missed:
-        verdict = f"posted, but {len(missed)} of {len(changed)} changed files never reached the review"
+    outcome = "posted" if posted else "nothing posted"
+    if missed:
+        verdict = f"{outcome}, but {len(missed)} of {len(changed)} changed files never reached the review"
     else:
-        verdict = f"posted, all {len(changed)} changed files reached the review"
+        verdict = f"{outcome}, all {len(changed)} changed files reached the review"
     lines = [
         f"Files reviewed: {len(seen)}/{len(changed)}",
         *(f"Never seen: `{f}`" for f in missed),
@@ -147,11 +148,11 @@ def main():
             fh.write(f"### Claude review: {verdict}\n\n" + "".join(f"- {l}\n" for l in lines))
     print(verdict, *lines, sep="\n")
 
-    if not posted:
-        print("::notice::The review posted nothing: no findings to post, or it stopped early.")
-    elif missed:
-        print(f"::error::The posted review never saw {len(missed)} of {len(changed)} changed files: {', '.join(missed)}")
+    if missed:
+        print(f"::error::The review never saw {len(missed)} of {len(changed)} changed files: {', '.join(missed)}")
         sys.exit(1)
+    if not posted:
+        print("::notice::The review saw every changed file and posted nothing: it found nothing to report.")
 
 
 if __name__ == "__main__":
