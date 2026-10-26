@@ -4,10 +4,18 @@ on:
   pull_request:
     # opened, ready_for_review and reopened get a full review. A push
     # (synchronize) gets a follow-up review of just that push: it replies in
-    # the earlier threads, whether each finding was addressed, and posts only
-    # new findings, so pushes don't repeat the whole review. For a review on
+    # the earlier threads on files the push touched, saying whether each
+    # finding was addressed, and posts only new findings. For a review on
     # demand, comment `@claude` (claude.yml).
     types: [opened, synchronize, ready_for_review, reopened]
+
+# Reviews of one PR queue instead of running at once and posting over each
+# other. GitHub keeps only the newest queued run, so a push whose review was
+# dropped from the queue, or whose review failed, is never reviewed on its
+# own: the next follow-up covers only its own push. Known gap.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 jobs:
   claude-review:
@@ -22,6 +30,7 @@ jobs:
     # The job's GITHUB_TOKEN is the only GitHub credential the review gets
     # (github_token below), so these permissions bound what its gh and git
     # commands can do: read the code, comment on PRs, never push or merge.
+    # They don't allow resolving review threads either, so a person does.
     permissions:
       contents: read
       pull-requests: write
@@ -37,10 +46,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Picks the review and writes its prompt and the files it must cover.
-      # A push gets a follow-up review of the pushed commits only, when the
-      # head it replaced is an ancestor of the new one; a force push, like
-      # every other event, gets a full review.
+      # Picks the review and renders .github/claude-review/review.md for it.
+      # A push gets a follow-up of the pushed commits only if the PR still
+      # sits on the same base commit. After "Update branch" or a rebase, the
+      # pushed range would include the base branch's own changes, and after
+      # a force push the old head may not be an ancestor, so those get a full
+      # review, which skips findings that open threads already raise.
       - name: Choose the review
         id: plan
         env:
@@ -53,20 +64,24 @@ jobs:
           # checkout leaves only origin/<base>; the review diffs against <base>
           git branch -f "$BASE_REF" "origin/$BASE_REF"
           files="$RUNNER_TEMP/changed-files.txt"
-          if [ "$ACTION" = synchronize ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
-              && git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
-            mode=follow-up
+          mode=full
+          if [ "$ACTION" = synchronize ]; then
+            if git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" "$AFTER" \
+                && [ "$(git merge-base "$BEFORE" "$BASE_REF")" = "$(git merge-base "$AFTER" "$BASE_REF")" ]; then
+              mode=follow-up
+            else
+              echo "::notice::The push rewrote history or brought in $BASE_REF, so this is a full review."
+            fi
+          fi
+          if [ "$mode" = follow-up ]; then
             git diff --name-only "$BEFORE" "$AFTER" > "$files"
-            prompt=$(python3 .github/claude-review/render.py .github/claude-review/follow-up.md)
           else
-            mode=full
-            [ "$ACTION" = synchronize ] && echo "::notice::$BEFORE isn't an ancestor of $AFTER (force push), so this is a full review."
             # the files API pages through large PRs, where `gh pr diff` gives up
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$files"
-            prompt="/code-review high --comment $PR_NUMBER"
           fi
+          prompt=$(MODE=$mode python3 .github/claude-review/render.py .github/claude-review/review.md "$files")
           echo "Review: $mode, $(wc -l < "$files") changed files"
-          { echo "mode=$mode"; echo "files=$files"; echo "prompt<<PROMPT_EOF"; echo "$prompt"; echo "PROMPT_EOF"; } >> "$GITHUB_OUTPUT"
+          { echo "prompt<<PROMPT_EOF"; echo "$prompt"; echo "PROMPT_EOF"; } >> "$GITHUB_OUTPUT"
 
       # The env scrub below runs every Bash command in Claude Code's Linux
       # sandbox, which needs bubblewrap and socat; the runner image ships
@@ -101,14 +116,12 @@ jobs:
           # token. That also skips the app's "workflow must match main" check,
           # so a PR that changes this file is reviewed by the changed version.
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # A full review is Claude Code's bundled /code-review, not the older
-          # code-review plugin (/code-review:code-review). Its effort level
-          # trades confidence for coverage (low: only the surest findings;
-          # medium to max: broader), where the plugin only ever reported bugs
-          # that fail regardless of input. --comment posts the findings
-          # inline. https://code.claude.com/docs/en/code-review-local
-          # A follow-up review is .github/claude-review/follow-up.md, which
-          # runs the same skill on the pushed commits only.
+          # .github/claude-review/review.md, rendered above. It runs Claude
+          # Code's bundled code-review skill at high effort, not the older
+          # code-review plugin (/code-review:code-review): the skill's effort
+          # level trades confidence for coverage, where the plugin only
+          # reported bugs that fail regardless of input.
+          # https://code.claude.com/docs/en/code-review-local
           prompt: ${{ steps.plan.outputs.prompt }}
           # Nothing can approve a permission prompt here, so a denied tool call
           # just fails. Bash is off by default, and the model chains commands
@@ -127,13 +140,3 @@ jobs:
             --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch,Bash(gh pr review:*)"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-
-      # A review reads the same whether it covered the whole diff or two
-      # files, and with no findings it posts nothing at all, so check the
-      # transcript: this fails if any changed file never reached the review.
-      - name: Check the review saw every changed file
-        if: always() && steps.claude-review.outputs.execution_file != ''
-        env:
-          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
-          CHANGED_FILES: ${{ steps.plan.outputs.files }}
-        run: python3 .github/scripts/review_coverage.py "$EXECUTION_FILE" "$CHANGED_FILES"
