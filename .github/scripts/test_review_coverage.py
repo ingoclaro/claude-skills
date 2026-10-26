@@ -124,10 +124,17 @@ class Posting(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("1 of 2 changed files never reached", line)
 
-    def test_denied_post_does_not_count_as_posted(self):
-        denied = bash("p", "gh pr comment 7 --body x", "This command requires approval", error=True)
-        self.assertEqual(self.verdict(self.full_diff + denied, ["a.py"])[1],
-                         "nothing posted, all 1 changed files reached the review")
+    def test_a_failed_post_does_not_count_as_posted_and_fails_the_check(self):
+        # the review found something and it never reached the pull request
+        failed = call("i", "mcp__github_inline_comment__create_inline_comment", {"path": "a.py"},
+                      "422 Unprocessable Entity", error=True)
+        code, line = self.verdict(self.full_diff + failed, ["a.py"])
+        self.assertEqual(line, "nothing posted, all 1 changed files reached the review")
+        self.assertEqual(code, 1)
+
+    def test_a_thread_reply_counts_as_posted(self):
+        reply = bash("p", "gh api repos/o/r/pulls/7/comments/123/replies -f body='Addressed in abc1234'")
+        self.assertTrue(self.verdict(self.full_diff + reply, ["a.py"])[1].startswith("posted"))
 
     def test_gh_api_post_counts_as_posted(self):
         api = bash("p", "gh api repos/o/r/issues/7/comments -f body=x")

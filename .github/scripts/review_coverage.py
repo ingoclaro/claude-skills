@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that a posted Claude review is backed by the files it was shown.
+"""Check that a Claude review saw every changed file, and posted what it meant to.
 
 A review's comment reads the same whether it reviewed the whole diff or
 skimmed two files (the old code-review plugin even posted a fixed "No issues
@@ -29,7 +29,9 @@ the bundled /code-review posts nothing when it finds nothing, so "nothing
 posted" can just as well be a clean review as a shallow one. Whether it
 posted (`gh pr comment`, a comment or review made through `gh api`, or an
 inline comment, counted only when the call succeeded) is reported, not
-judged.
+judged. But a post that was attempted and failed also exits 1: the review
+found something and it never reached the pull request, which would
+otherwise look the same as a review that found nothing.
 
 Prints counts, model names, file paths and the first line of up to three
 distinct Bash errors (token-shaped text redacted), never other transcript
@@ -97,12 +99,13 @@ def main():
             c = b.get("content")
             results[b.get("tool_use_id")] = (c if isinstance(c, str) else json.dumps(c), bool(b.get("is_error")))
 
-    reads, shown, agents, posted, bash_failed, errors = set(), [], [], False, 0, []
+    reads, shown, agents, posted, bash_failed, errors, post_failed = set(), [], [], False, 0, [], 0
     for use_id, (name, inp) in uses.items():
         output, failed = results.get(use_id, ("", True))
         if name == "Agent":
             agents.append(f"{inp.get('model') or 'default'}: {inp.get('description', '')}")
         if failed:  # denied or errored: nothing was shown, nothing was posted
+            post_failed += posts(name, inp)
             if name == "Bash":
                 bash_failed += 1
                 first = SECRET.sub("[redacted]", (output.strip().splitlines() or [""])[0])[:160]
@@ -135,6 +138,7 @@ def main():
         f"Subagents: {len(agents)}" + (f" ({'; '.join(agents)})" if agents else ""),
         f"Models: {', '.join(sorted(result.get('modelUsage') or {}))}",
         f"Permission denials: {len(result.get('permission_denials') or [])}",
+        f"Failed posts: {post_failed}",
         # every Bash call failing means the shell itself is broken (for
         # example the env scrub's bwrap sandbox can't start), not the review
         f"Bash calls failed: {bash_failed} of {sum(1 for n, _ in uses.values() if n == 'Bash')}",
@@ -148,8 +152,11 @@ def main():
             fh.write(f"### Claude review: {verdict}\n\n" + "".join(f"- {l}\n" for l in lines))
     print(verdict, *lines, sep="\n")
 
+    if post_failed:
+        print(f"::error::{post_failed} of the review's attempts to post to the pull request failed, so findings may be missing from it.")
     if missed:
         print(f"::error::The review never saw {len(missed)} of {len(changed)} changed files: {', '.join(missed)}")
+    if post_failed or missed:
         sys.exit(1)
     if not posted:
         print("::notice::The review saw every changed file and posted nothing: it found nothing to report.")
