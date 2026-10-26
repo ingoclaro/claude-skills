@@ -3,28 +3,47 @@
 
 The code-review plugin posts the same fixed comment ("No issues found.
 Checked for bugs and CLAUDE.md compliance.") whether it reviewed the whole
-diff or skimmed two files, so the comment can't tell you. The transcript can:
-a changed file reached the review if its diff hunk appeared in some tool
-output (`gh pr diff`, `git diff`), or the file itself was read (`Read`, or
-`cat`/`head`/`sed -n` in Bash). A file name alone, as in
-`gh pr view --json files`, doesn't count.
+diff or skimmed two files, so the comment can't tell you. The transcript can.
+A changed file reached the review if:
 
-Rule: if the run posted anything, every changed file must have reached the
-review, or this exits 1 and names the files it never saw. A run that posted
-nothing (the plugin stops early on closed, draft, trivial or already-reviewed
-PRs) published no verdict, so it only gets a notice.
+- its diff header appeared in some tool output (`gh pr diff`, `git diff`),
+  matched on the new path, so a renamed file counts; or
+- the file itself was read: by `Read`, or by `cat`/`head`/`tail`/`sed -n`
+  in Bash, with a path argument that is that file, relative (`a.py`,
+  `./a.py`) or absolute under the repo root. So `cat data.py` doesn't count
+  for `a.py`, and `/repo/docs/README.md` doesn't count for `README.md`. A
+  partial read counts: the check is that the file was shown, not how much.
+
+A listing of diff headers (`grep -n '^diff' pr.diff`) shows `51:diff --git
+a/f b/f` but not the file's change, so a header only counts at the start of
+a line.
+
+A file name alone, as in `gh pr view --json files`, doesn't count.
+
+Rule: if the run posted anything (`gh pr comment`, a comment or review made
+through `gh api`, or an inline comment) and the call succeeded, every changed
+file must have reached the review, or this exits 1 and names the files it
+never saw. A run that posted nothing (the plugin stops early on closed, draft,
+trivial or already-reviewed PRs) published no verdict, so it only gets a
+notice.
 
 Prints counts, model names and file paths only, never transcript text: the
 logs of a public repo are public.
 
 Usage: review_coverage.py <execution_file> <changed_files.txt>
+  changed_files.txt: one path per line, as `gh api .../pulls/N/files` lists them
+  The repo root is $GITHUB_WORKSPACE, or the current directory.
 """
 import json
 import os
 import re
 import sys
 
-READ_CMD = re.compile(r"\b(cat|head|tail|sed -n|less)\b")
+READ_CMD = re.compile(r"(^|[\s;&|(])(cat|head|tail|sed -n|less)\s")
+GH_API_POST = re.compile(
+    r"\bgh api\b(?=.*/(comments|reviews)\b)(?=.*(\s-X\s*POST|\s--method\s+POST|\s-[fF]\s|\s--(raw-)?field|\s--input))"
+)
+INLINE_COMMENT = "mcp__github_inline_comment__create_inline_comment"
 
 
 def blocks(messages):
@@ -37,33 +56,60 @@ def blocks(messages):
                 yield b
 
 
+def names(path, candidate, root):
+    """True when `candidate` is the changed file `path`, relative or absolute."""
+    candidate = candidate.strip("'\"")
+    return candidate in (path, f"./{path}", os.path.join(root, path))
+
+
+def mentions(path, command, root):
+    """True when some whitespace-separated argument of `command` is `path`."""
+    return any(names(path, arg, root) for arg in command.split())
+
+
+def posts(name, inp):
+    """True when this tool call publishes something on the PR."""
+    if name == INLINE_COMMENT:
+        return True
+    cmd = inp.get("command", "") if name == "Bash" else ""
+    return bool(re.search(r"\bgh pr comment\b", cmd) or GH_API_POST.search(cmd))
+
+
 def main():
-    messages = json.load(open(sys.argv[1]))
-    changed = open(sys.argv[2]).read().split()
-    reads, shown, outputs, agents, posted = set(), [], [], [], False
+    with open(sys.argv[1]) as fh:
+        messages = json.load(fh)
+    with open(sys.argv[2]) as fh:
+        changed = [line.strip() for line in fh if line.strip()]
+    root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+
+    uses, results = {}, {}
     for b in blocks(messages):
         if b.get("type") == "tool_use":
-            name, inp = b.get("name"), b.get("input") or {}
-            if name == "Read":
-                reads.add(inp.get("file_path", ""))
-            elif name == "Agent":
-                agents.append(f"{inp.get('model') or 'default'}: {inp.get('description', '')}")
-            elif name == "Bash":
-                cmd = inp.get("command", "")
-                if READ_CMD.search(cmd):
-                    shown.append(cmd)
-                if "gh pr comment" in cmd:
-                    posted = True
-            elif name == "mcp__github_inline_comment__create_inline_comment":
-                posted = True
+            uses[b.get("id")] = (b.get("name"), b.get("input") or {})
         elif b.get("type") == "tool_result":
             c = b.get("content")
-            outputs.append(c if isinstance(c, str) else json.dumps(c))
-    text = "\n".join(outputs)
+            results[b.get("tool_use_id")] = (c if isinstance(c, str) else json.dumps(c), bool(b.get("is_error")))
+
+    reads, shown, agents, posted, bash_failed = set(), [], [], False, 0
+    for use_id, (name, inp) in uses.items():
+        output, failed = results.get(use_id, ("", True))
+        if name == "Agent":
+            agents.append(f"{inp.get('model') or 'default'}: {inp.get('description', '')}")
+        if failed:  # denied or errored: nothing was shown, nothing was posted
+            bash_failed += name == "Bash"
+            continue
+        if name == "Read":
+            reads.add(inp.get("file_path", ""))
+        elif name == "Bash" and READ_CMD.search(inp.get("command", "")):
+            shown.append(inp["command"])
+        if posts(name, inp):
+            posted = True
+
+    text = "\n".join(out for out, failed in results.values() if not failed)
     seen = [f for f in changed
-            if f"diff --git a/{f} b/{f}" in text
-            or any(r.endswith("/" + f) for r in reads)
-            or any(f in c for c in shown)]
+            if re.search(rf'^diff --git .* "?b/{re.escape(f)}"?$', text, re.M)
+            or any(names(f, r, root) for r in reads)
+            or any(mentions(f, c, root) for c in shown)]
     missed = [f for f in changed if f not in seen]
 
     result = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("type") == "result"), {})
@@ -79,6 +125,9 @@ def main():
         f"Subagents: {len(agents)}" + (f" ({'; '.join(agents)})" if agents else ""),
         f"Models: {', '.join(sorted(result.get('modelUsage') or {}))}",
         f"Permission denials: {len(result.get('permission_denials') or [])}",
+        # every Bash call failing means the shell itself is broken (for
+        # example the env scrub's bwrap sandbox can't start), not the review
+        f"Bash calls failed: {bash_failed} of {sum(1 for n, _ in uses.values() if n == 'Bash')}",
     ]
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
