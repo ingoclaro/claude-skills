@@ -57,3 +57,16 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
+      # The plugin posts the same "No issues found" comment whether it read
+      # the whole diff or two files, so check the transcript: a posted review
+      # fails this step if any changed file never reached it.
+      - name: Check the review saw every changed file
+        if: always() && steps.claude-review.outputs.execution_file != ''
+        env:
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only > "$RUNNER_TEMP/changed-files.txt"
+          python3 .github/scripts/review_coverage.py "$EXECUTION_FILE" "$RUNNER_TEMP/changed-files.txt"
+
