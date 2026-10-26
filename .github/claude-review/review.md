@@ -74,12 +74,13 @@ elsewhere, for example in a file the thread isn't about, is a new finding.
 
 That includes resolved threads: a person resolved them, either because the
 finding was fixed or because they decided it doesn't apply, and either way
-it shouldn't come back. The one exception is a regression. In a follow-up
-review, a finding in the code these commits changed that matches a resolved
-thread means the commits brought the problem back, since a dismissed
-finding's code would not have changed. Post it as a new finding that says
-so and links the earlier thread, unless a person's comment on that thread
-says the finding doesn't apply. In a full review, drop it.
+it shouldn't come back. The one exception is a regression: the finding was
+fixed, and the problem is back. Count it as one only if the thread's latest
+`github-actions` reply says `Addressed in …`, or, in a follow-up review,
+these commits changed the very lines whose earlier change fixed it. A person
+may resolve a thread without a comment because they decided the finding
+doesn't apply, so a later edit near the same code is not enough. Post a
+regression as a new finding that says so and links the earlier thread.
 
 Post each remaining finding as an inline comment
 on the line it is about in the head commit, with

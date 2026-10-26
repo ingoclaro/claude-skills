@@ -3,10 +3,10 @@ name: Claude Code Review
 on:
   pull_request:
     # opened, ready_for_review and reopened get a full review. A push
-    # (synchronize) gets a follow-up review of just that push: it replies in
-    # the earlier threads on files the push touched, saying whether each
-    # finding was addressed, and posts only new findings. For a review on
-    # demand, comment `@claude` (claude.yml).
+    # (synchronize) gets a follow-up review of the commits since the last
+    # successful review: it replies in the earlier unresolved threads, saying
+    # whether each finding was addressed, and posts only new findings. For a
+    # review on demand, comment `@claude` (claude.yml).
     types: [opened, synchronize, ready_for_review, reopened]
 
 # Reviews of one PR queue instead of running at once and posting over each
@@ -43,7 +43,8 @@ jobs:
     steps:
       # The PR's head commit, not the merge commit checkout defaults to, so
       # line numbers read from the working tree match the lines inline
-      # comments have to target. The whole history, so the review can diff
+      # comments have to target. The prompt and render.py still come from the
+      # merge commit, like this workflow file (see "Choose the review"). The whole history, so the review can diff
       # with git against the base branch and against the last reviewed head.
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,9 +54,11 @@ jobs:
 
       # Picks the review and renders .github/claude-review/review.md for it.
       # A push gets a follow-up of the commits since the head of the last
-      # successful review of this branch, so commits whose review failed or
-      # was dropped are still covered. That needs such a review to exist and
-      # the PR to still sit on the same base commit. After "Update branch" or
+      # successful review of this PR, so commits whose review failed or was
+      # dropped are still covered. A run counts only if its claude-review job
+      # ran and succeeded: a run whose job was skipped (a draft) can still
+      # report success. That needs such a review to exist and the PR to still
+      # sit on the same base commit; if the lookup fails, it's a full review. After "Update branch" or
       # a rebase, the range would include the base branch's own changes, and
       # after a force push the old head may not be an ancestor, so those get
       # a full review, which skips findings that earlier threads already raise.
@@ -70,11 +73,33 @@ jobs:
         run: |
           # checkout leaves only origin/<base>; the review diffs against <base>
           git branch -f "$BASE_REF" "origin/$BASE_REF"
+          # The prompt and render.py from the merge commit ($GITHUB_SHA), the
+          # same version as this workflow file, not from a possibly older head.
+          cfg="$RUNNER_TEMP/claude-review"
+          mkdir -p "$cfg"
+          if git fetch -q --no-tags origin "$GITHUB_SHA"; then
+            git show "$GITHUB_SHA:.github/claude-review/render.py" > "$cfg/render.py"
+            git show "$GITHUB_SHA:.github/claude-review/review.md" > "$cfg/review.md"
+          else
+            echo "::warning::Couldn't fetch the merge commit, so the prompt comes from the PR head."
+            cp .github/claude-review/render.py .github/claude-review/review.md "$cfg/"
+          fi
           files="$RUNNER_TEMP/changed-files.txt"
           mode=full
+          BEFORE=
           if [ "$ACTION" = synchronize ]; then
-            BEFORE=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/claude-code-review.yml/runs?event=pull_request&status=success&branch=$HEAD_REF&per_page=1" \
-              --jq '.workflow_runs[0].head_sha // empty')
+            # -f lets gh URL-encode the branch name, which may contain + & #
+            runs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/claude-code-review.yml/runs" \
+                -f event=pull_request -f status=success -f branch="$HEAD_REF" -f per_page=20 \
+                --jq '.workflow_runs[] | select(any(.pull_requests[]; .number == ($ENV.PR_NUMBER | tonumber))) | "\(.id) \(.head_sha)"') \
+              || { echo "::warning::Couldn't list earlier reviews."; runs=; }
+            while read -r id sha; do
+              [ -n "$id" ] || continue
+              job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  --jq '.jobs[] | select(.name == "claude-review") | .conclusion') \
+                || { echo "::warning::Couldn't read run $id."; break; }
+              if [ "$job" = success ]; then BEFORE=$sha; break; fi
+            done <<< "$runs"
             if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null && git merge-base --is-ancestor "$BEFORE" "$AFTER" \
                 && [ "$(git merge-base "$BEFORE" "$BASE_REF")" = "$(git merge-base "$AFTER" "$BASE_REF")" ]; then
               mode=follow-up
@@ -90,7 +115,7 @@ jobs:
             # the files API pages through large PRs, where `gh pr diff` gives up
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$files"
           fi
-          prompt=$(MODE=$mode BEFORE=$BEFORE python3 .github/claude-review/render.py .github/claude-review/review.md "$files")
+          prompt=$(MODE=$mode BEFORE=$BEFORE python3 "$cfg/render.py" "$cfg/review.md" "$files")
           echo "Review: $mode, $(wc -l < "$files") changed files"
           { echo "prompt<<PROMPT_EOF"; echo "$prompt"; echo "PROMPT_EOF"; } >> "$GITHUB_OUTPUT"
 
