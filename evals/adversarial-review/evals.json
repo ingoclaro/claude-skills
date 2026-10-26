@@ -1,7 +1,7 @@
 {
   "skill_name": "adversarial-review",
   "executor_model": "claude-sonnet-5-5",
-  "notes": "Runs are headless `claude -p --output-format stream-json --verbose` sessions inside a fresh copy of each fixture repo (setup_fixtures.sh). Agent-tool subagents can't be the executor: the skill itself dispatches a background Opus reviewer, which calls /code-review. with_skill sends `prompt` (the slash command); without_skill sends `baseline_prompt`, the same request in plain words, with the Skill tool disallowed. Each run gets its own TMPDIR under the run dir, passed with --add-dir, since sandboxes often block /tmp. Every assertion is checked by grade_runs.py against the fixture's planted ground truth, the run's repo state and its transcript; `check` names the function that grades it.",
+  "notes": "Runs are headless `claude -p --output-format stream-json --verbose` sessions inside a fresh copy of each fixture repo (setup_fixtures.sh). Agent-tool subagents can't be the executor: the skill itself dispatches a background Sonnet reviewer (Opus in the opus_reviewer variant), which calls /code-review. with_skill sends `prompt` (the slash command); without_skill sends `baseline_prompt`, the same request in plain words, with the Skill tool disallowed. Each run gets its own TMPDIR under the run dir, passed with --add-dir, since sandboxes often block /tmp. Every assertion is checked by grade_runs.py against the fixture's planted ground truth, the run's repo state and its transcript; `check` names the function that grades it.",
   "evals": [
     {
       "id": 1,

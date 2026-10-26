@@ -177,8 +177,6 @@ def bug_demonstrated(run):
     runner = re.compile(r"\b(bun|node|deno|tsx)\s+(-e|--eval|-p|--print)\b"
                         r"|\b(bun|node|deno|tsx)\s+(run\s+)?\S+\.(m?[jt]sx?)\b"
                         r"|\bnpx\s+tsx\b")
-    # A probe run through the test runner counts too, but not the suite itself.
-    probe_test = re.compile(r"\bbun\s+test\s+\S*(/tmp|tmp/|probe|repro)")
     failed = re.compile(r"^ERROR |No such file|ENOENT|Module not found|not found|Cannot find|permission", re.I | re.M)
     fixture_tests = set(git(run.fixture, "ls-files", "*.test.*").splitlines())
     fixture_tests |= {f.rsplit("/", 1)[-1] for f in fixture_tests}
@@ -189,10 +187,9 @@ def bug_demonstrated(run):
         # "error: expect(" is a probe test failing as intended: that's the demonstration
         if not out or "mutate.ts" in c or failed.search(out) or re.search(r"^error: (?!expect\()|ModuleNotFound|EACCES", out, re.M):
             return False
-        m = probe_test.search(c)
-        if m:  # the output must come from the probe, not a suite run in the same command
-            probe = re.search(r"\bbun\s+test\s+(\S+)", c).group(1).rsplit("/", 1)[-1]
-            return probe in out
+        probes = probe_tests(c)
+        if probes:  # the output must come from the probe, not a suite run in the same command
+            return any(p in out for p in probes)
         direct = [m for m in runner.finditer(c) if not m.group(0).startswith(("bun test", "bun run test"))]
         if direct:
             return True
@@ -203,6 +200,22 @@ def bug_demonstrated(run):
         return False
     hits = [c for c, out in run.bash_runs() if ran(c, out)]
     return (True, hits[0][:200]) if hits else (False, f"{len(run.bash())} Bash calls, none ran a repro that produced output")
+
+
+def probe_tests(command):
+    """File names of the probes a command runs through the test runner.
+
+    A probe is a `bun test` path argument in a temp dir or named probe/repro,
+    from any `bun test` in the command, past any flags. A suite run (`bun test
+    src/`) names none.
+    """
+    names = []
+    for seg in re.split(r"&&|\|\||[;|\n]", command):
+        m = re.match(r"\s*bun\s+test\b(.*)", seg)
+        if m:
+            names += [t.strip("'\"").rsplit("/", 1)[-1] for t in m.group(1).split()
+                      if not t.startswith("-") and re.search(r"/tmp|tmp/|probe|repro", t)]
+    return [n for n in names if n]
 
 
 def reports_cache_aliasing(run):
@@ -227,16 +240,39 @@ def names_rollover_gap(run):
     return (True, snippet(run.text, m)) if m else (False, "the rollover rule is never tied to missing tests")
 
 
+def rule_mutants(run):
+    """Names of the mutants written to mutate.ts whose "find" is in the rollover rule."""
+    names = set()
+    for n, i, _ in run.tools:
+        text = i.get("content", "") if n == "Write" else i.get("command", "") if n == "Bash" else ""
+        try:
+            objs = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            # a mutants file written by a shell command: its flat objects
+            objs = []
+            for m in re.finditer(r"\{[^{}]*\}", text):
+                try:
+                    objs.append(json.loads(m.group(0)))
+                except json.JSONDecodeError:
+                    pass
+        for m in objs if isinstance(objs, list) else [objs]:
+            if (isinstance(m, dict) and isinstance(m.get("name"), str)
+                    and re.search(r"1023\.95|unit > 0", str(m.get("find", "")))):
+                names.add(m["name"])
+    return names
+
+
 def gap_proven(run):
     # A mutant on the rollover rule (its threshold or its block) that the
-    # commit's tests let through. In the baseline that means doing the
-    # mutation by hand: editing the rule and running the suite green.
-    written = " ".join(json.dumps(i) for n, i, _ in run.tools if n in ("Write", "Edit", "Bash"))
-    targets_rule = re.search(r"1023\.95|unit\+\+", written) is not None
-    survived = [o for c, o in run.bash_runs() if re.search(r"^SURVIVED", o, re.M)]
-    if targets_rule and survived:
-        line = next(l for l in survived[0].splitlines() if l.startswith("SURVIVED"))
-        return True, line[:200]
+    # commit's tests let through: the SURVIVED line must name that mutant, not
+    # some other survivor. In the baseline that means doing the mutation by
+    # hand: editing the rule and running the suite green.
+    rule = rule_mutants(run)
+    for c, o in run.bash_runs():
+        for line in o.splitlines():
+            m = re.match(r"SURVIVED\s+(.*)", line)
+            if m and any(m.group(1).startswith(f"{name}:") for name in rule):
+                return True, line[:200]
     # By hand: an Edit that takes the rule out of the source, then the next
     # test run still green.
     edited = False
@@ -250,7 +286,7 @@ def gap_proven(run):
             if re.search(r"\b0 fail\b", out):
                 return True, f"rule edited out by hand, then: {i['command'][:80]} -> {' '.join(out.split())[:80]}"
             edited = False
-    return False, ("no surviving mutant" if targets_rule else "no mutant or edit touched the rollover rule")
+    return False, ("no mutant on the rollover rule survived" if rule else "no mutant or edit touched the rollover rule")
 
 
 def reports_test_gap(run):

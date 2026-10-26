@@ -1,7 +1,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { $ } from "bun";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 const script = join(import.meta.dir, "../../skills/adversarial-review/scripts/mutate.ts");
@@ -34,8 +34,8 @@ async function mutate(dir: string, mutants: unknown, cmd = "bun test", extra: st
     stdout: "pipe",
     stderr: "pipe",
   });
-  const out = (await new Response(proc.stdout).text()) + (await new Response(proc.stderr).text());
-  return { code: await proc.exited, out };
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code: await proc.exited, out: stdout + stderr };
 }
 
 const add = {
@@ -113,7 +113,49 @@ test("exits 3, not 1, when the script itself can't run, so it isn't read as a su
   expect(badTmp.out).toContain("pass a writable --tmp");
   const notArray = await mutate(dir, { name: "minus" });
   expect(notArray.code).toBe(3);
-  expect(notArray.out).toContain("expected a JSON array");
+  expect(notArray.out).toContain("expected a JSON array");  const badTimeout = await mutate(dir, minus, "bun test", ["--timeout", "abc"]);
+  expect(badTimeout.code).toBe(3);
+  expect(badTimeout.out).toContain("--timeout");
+  const noCommits = await tempDir();
+  await Bun.write(join(noCommits, "add.ts"), add["add.ts"]);
+  await $`git init -q`.cwd(noCommits);
+  const unborn = await mutate(noCommits, minus);
+  expect(unborn.code).toBe(3);
+  expect(unborn.out).toContain("could not run");
+});
+
+test("copies names git would quote and symlinks, and leaves out nested repos", async () => {
+  const dir = await repo({
+    ...add,
+    "café.ts": 'export const name = "café";\n',
+    "café.test.ts": 'import { test, expect } from "bun:test";\nimport { name } from "./café";\nimport { add } from "./link";\ntest("name", () => { expect(name).toBe("café"); expect(add(1, 1)).toBe(2); });\n',
+  });
+  await symlink("add.ts", join(dir, "link.ts"));
+  await symlink("no-such-file", join(dir, "dangling"));
+  await $`git init -q nested && git -C nested -c user.name=t -c user.email=t@t commit -q --allow-empty -m n`.cwd(dir);
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm links`.cwd(dir);
+  const { code, out } = await mutate(dir, [{ name: "accent", file: "café.ts", find: '"café"', replace: '"cafe"' }], "bun test", ["--all"]);
+  expect(out).toMatch(/caught\s+accent/);
+  expect(code).toBe(0);
+});
+
+test("writes $ patterns in the replace text as is", async () => {
+  // Read as a replacement pattern, "$&" would put "a + b" back: no mutation, so
+  // it would survive. Written as is, it breaks the code and is caught.
+  const dir = await repo(add);
+  const { out } = await mutate(dir, [{ name: "dollar", file: "add.ts", find: "a + b", replace: "$&" }]);
+  expect(out).toMatch(/caught\s+dollar/);
+});
+
+test("a timeout kills the whole test process tree", async () => {
+  // The runner is a grandchild of sh: killing only sh would leave it holding
+  // the output pipes until it exits on its own.
+  const dir = await repo(add);
+  const hang = [{ name: "hang", file: "add.ts", find: "a + b", replace: "(() => { while (true) {} })()" }];
+  const start = Date.now();
+  const { out } = await mutate(dir, hang, "bun test && true", ["--timeout", "2"]);
+  expect(out).toMatch(/TIMEOUT\s+hang/);
+  expect(Date.now() - start).toBeLessThan(20_000);
 });
 
 test("a mutant that hangs times out and counts as caught", async () => {

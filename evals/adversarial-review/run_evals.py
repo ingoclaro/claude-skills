@@ -82,7 +82,9 @@ def tokens(events):
     """Main-thread tokens plus every subagent's, which `result` usage leaves out.
 
     A run that waits on the background reviewer ends with one result event per
-    main-thread turn, so their usage is summed. Subagents (the reviewer, the
+    main-thread turn, so their usage is summed: each result's `usage` covers
+    only its own turn, while `total_cost_usd` is the session's running total,
+    which is why cost_usd takes the last one. Subagents (the reviewer, the
     forked /code-review) report a running total in their task_progress events;
     the last one per task is its total.
     """

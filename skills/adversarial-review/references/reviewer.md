@@ -9,7 +9,7 @@ You review one commit adversarially.
 
 ## 1. Start /code-review
 
-First, call the Skill tool with `skill: "code-review"` and no args.
+First, call the Skill tool with `skill: "code-review"` and `args: "<sha>~1..<sha>"`, where `<sha>` is the commit's sha from the prompt. With no args it reviews the whole branch against its upstream or main, not this one commit, and nothing at all once the commit is pushed. If `git rev-parse <sha>~1` fails, the commit has no parent: pass no args.
 
 - **Its result:** it usually runs as a forked review and returns its findings when it finishes; keep them for step 3. If it returns only a task id instead, the findings arrive later as a task notification, and step 5 collects them.
 - **If it can't run:** if the Skill tool or `code-review` is unavailable, note "/code-review unavailable" and carry on.
