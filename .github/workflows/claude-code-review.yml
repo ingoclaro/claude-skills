@@ -16,11 +16,13 @@ jobs:
     if: contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
 
     runs-on: ubuntu-latest
+    # The job's GITHUB_TOKEN is the only GitHub credential the review gets
+    # (github_token below), so these permissions bound what its gh and git
+    # commands can do: read the code, comment on PRs, never push or merge.
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: read
-      id-token: write
 
     steps:
       - name: Checkout repository
@@ -28,23 +30,74 @@ jobs:
         with:
           fetch-depth: 1
 
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (below) runs each Bash command in a
+      # bubblewrap sandbox, and Claude Code won't start without it. The
+      # runner image doesn't ship it.
+      # The env scrub below runs every Bash command in Claude Code's Linux
+      # sandbox, which needs bubblewrap and socat; the runner image ships
+      # neither. Ubuntu 24.04's AppArmor also blocks bwrap from creating user
+      # namespaces, so this adds the profile the sandboxing docs give, which
+      # unconfines bwrap only. Setup as in
+      # https://code.claude.com/docs/en/sandboxing. The preflight runs bwrap
+      # once so a broken sandbox fails here, with its real error, instead of
+      # as a review in which every command fails.
+      - name: Install the Bash sandbox
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
+          printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' \
+            '  include if exists <local/bwrap>' '}' | sudo tee /etc/apparmor.d/bwrap > /dev/null
+          sudo systemctl reload apparmor
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true && echo "bubblewrap works"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
+        env:
+          # All of Bash is allowed below, so strip credentials (above all
+          # CLAUDE_CODE_OAUTH_TOKEN) from the environment of every command
+          # Claude runs. GITHUB_TOKEN stays, for gh, so the job permissions
+          # above still matter. The action only sets this itself when
+          # allowed_non_write_users is used.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use the job token instead of exchanging OIDC for the Claude App's
+          # token. That also skips the app's "workflow must match main" check,
+          # so a PR that changes this file is reviewed by the changed version.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # Bash is off by default in this action, and the code-review plugin
-          # fans out to subagents (Task) that read the PR with gh/git, so all of
-          # that must be allowed or the first subagent's `gh pr view` is denied
-          # and the review stops without posting. --disallowedTools keeps it
-          # read-only (it wins over the allowlist inside subagents too), and
-          # `gh pr review` is left out so the bot can't approve or block.
+          # Nothing can approve a permission prompt here, so a denied tool call
+          # just fails. Bash is off by default, and the model chains commands
+          # (`gh pr diff > f; grep ...`, `gh api`, `git ls-files | grep`) that
+          # prefix rules like Bash(gh pr diff:*) can't match, so all of Bash is
+          # allowed; the token's permissions above are the real boundary.
+          # Opus runs the plugin's subagent fan-out reliably; Sonnet, the
+          # default, often skips it and answers "no issues" after a shallow
+          # read. Denying `gh pr review` only stops the obvious way to approve:
+          # `gh api .../reviews` still gets past it. What actually stops the
+          # bot approving is the job token plus the repo's default setting
+          # that doesn't let Actions approve pull requests.
           claude_args: >-
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,SlashCommand,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
-            --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch"
+            --model opus
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash,Read,Glob,Grep,Agent"
+            --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch,Bash(gh pr review:*)"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
+
+      # The plugin posts the same "No issues found" comment whether it read
+      # the whole diff or two files, so check the transcript: a posted review
+      # fails this step if any changed file never reached it.
+      - name: Check the review saw every changed file
+        if: always() && steps.claude-review.outputs.execution_file != ''
+        env:
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # the files API pages through large PRs, where `gh pr diff` gives up
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$RUNNER_TEMP/changed-files.txt"
+          python3 .github/scripts/review_coverage.py "$EXECUTION_FILE" "$RUNNER_TEMP/changed-files.txt"
 
