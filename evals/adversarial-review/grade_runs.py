@@ -286,8 +286,9 @@ _DELIM = r"<<-?\s*['\"]?(?P<delim>\w+)['\"]?"
 _BODY = r"[^\n]*\n(?P<body>.*?)\n\s*(?P=delim)\b"
 HEREDOCS = (re.compile(rf"(?:cat|tee)\s*>?\s*{_PATH}\s*{_DELIM}{_BODY}", re.S),
             re.compile(rf"(?:cat|tee)\s*{_DELIM}\s*>\s*{_PATH}{_BODY}", re.S))
-# A shell redirect into a file, to spot a tracked file rewritten some other way.
-REDIRECT = re.compile(r">>?\s*['\"]?([^\s'\"<>;|&]+)")
+# A shell redirect into a file: a ">" that starts a token (not "=>", "->" or
+# ">="), then a path on the same line.
+REDIRECT = re.compile(r"(?<![-=<>\w])>>?[ \t]*['\"]?([^\s'\"<>;|&=]+)")
 # A line of mutate.ts results, which marks a call that ran it, however it was named.
 RESULT_LINE = re.compile(r"^(SURVIVED|caught|NOT APPLIED|TIMEOUT)\s+\S", re.M)
 # Tools whose output can carry a background mutate.ts run's results.
@@ -325,15 +326,20 @@ def rule_mutants_by_call(run):
             loose.append(i.get("new_string", ""))
         elif n == "Bash":
             c = i.get("command", "")
-            docs = {m["path"]: m["body"] for h in HEREDOCS for m in h.finditer(c)}
-            files.update(docs)
-            # A tracked file rewritten other than by a heredoc (echo, printf):
-            # its stored text is stale, so drop it and keep the command.
-            for target in REDIRECT.findall(c):
-                if target not in docs:
-                    for f in [f for f in files if f == target or os.path.basename(f) == os.path.basename(target)]:
-                        del files[f]
-            if not docs or set(REDIRECT.findall(c)) - set(docs):
+            # Heredocs in the order they're written, so a later one wins.
+            docs = sorted((m for h in HEREDOCS for m in h.finditer(c)), key=lambda m: m.start())
+            for m in docs:
+                files[m["path"]] = m["body"]
+            # Any other redirect (echo, printf) rewrites its exact target with
+            # whatever the command holds; mutant_objects finds the JSON in it.
+            # Heredoc spans are cut first, so a ">=" in a body isn't one.
+            rest = c
+            for m in reversed(docs):
+                rest = rest[:m.start()] + rest[m.end():]
+            targets = REDIRECT.findall(rest)
+            for target in targets:
+                files[target] = c
+            if not docs and not targets:
                 loose.append(c)
             if "mutate.ts" in c or RESULT_LINE.search(run.outputs.get(t, "")):
                 named = [text for f, text in files.items() if f and os.path.basename(f) in c]

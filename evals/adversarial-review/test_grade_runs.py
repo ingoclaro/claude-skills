@@ -105,6 +105,40 @@ class GapProven(unittest.TestCase):
         )
         self.assertTrue(g.gap_proven(run)[0])
 
+    def test_a_backup_with_the_same_name_keeps_the_original(self):
+        run = FakeRun(
+            write("/r/m.json", [RULE]),
+            bash("cat /r/m.json > /tmp/bak/m.json"),
+            bash("bun mutate.ts /r/m.json", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
+    def test_output_redirected_to_a_same_named_file_keeps_the_mutants(self):
+        run = FakeRun(
+            write("/r/m.json", [RULE]),
+            bash("bun mutate.ts /r/m.json > /tmp/m.json; tail /tmp/m.json", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
+    def test_a_comparison_in_a_heredoc_body_is_not_a_redirect(self):
+        off_rule = dict(RULE, find="bytes < 0")
+        run = FakeRun(
+            bash(heredoc("/r/m.json", [RULE])),
+            write("/r/m.json", [off_rule]),
+            bash("./go.sh", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertFalse(g.gap_proven(run)[0])
+
+    def test_the_later_of_two_heredocs_to_one_path_wins(self):
+        rule, other = json.dumps([RULE]), json.dumps([dict(OTHER, name="threshold")])
+        both = f"cat <<'EOF' > /r/m.json\n{rule}\nEOF\ncat > /r/m.json <<'EOF'\n{other}\nEOF"
+        run = FakeRun(bash(both), bash("bun mutate.ts /r/m.json", "SURVIVED    threshold: all tests passed"))
+        self.assertFalse(g.gap_proven(run)[0])
+
+    def test_arrows_are_not_redirects(self):
+        self.assertEqual(g.REDIRECT.findall("x =>\n  m.json; a -> b; v >= 1"), [])
+        self.assertEqual(g.REDIRECT.findall("echo hi > /r/m.json 2>&1"), ["/r/m.json"])
+
     def test_run_through_a_wrapper_that_never_names_the_script(self):
         run = FakeRun(
             write("/r/m.json", [RULE]),
