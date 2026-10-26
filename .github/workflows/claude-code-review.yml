@@ -51,7 +51,7 @@ jobs:
       # sits on the same base commit. After "Update branch" or a rebase, the
       # pushed range would include the base branch's own changes, and after
       # a force push the old head may not be an ancestor, so those get a full
-      # review, which skips findings that open threads already raise.
+      # review, which skips findings that earlier threads already raise.
       - name: Choose the review
         id: plan
         env:
