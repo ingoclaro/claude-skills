@@ -122,6 +122,13 @@ class Posting(unittest.TestCase):
         broken = bash("a", "gh pr view 7", "bwrap: setting up uid map: Permission denied", error=True)
         _, out = run(broken + bash("b", "gh pr diff 7", "diff --git a/a.py b/a.py\n"), ["a.py"])
         self.assertIn("Bash calls failed: 1 of 2", out)
+        self.assertIn("Bash error: `bwrap: setting up uid map: Permission denied`", out)
+
+    def test_error_lines_are_redacted(self):
+        leak = bash("a", "env", "token=sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789 failed", error=True)
+        _, out = run(leak, ["a.py"])
+        self.assertNotIn("abcdefghij", out)
+        self.assertIn("[redacted]", out)
 
     def test_inline_comment_counts_as_posted(self):
         inline = call("i", "mcp__github_inline_comment__create_inline_comment", {"path": "a.py"})

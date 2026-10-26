@@ -27,8 +27,9 @@ never saw. A run that posted nothing (the plugin stops early on closed, draft,
 trivial or already-reviewed PRs) published no verdict, so it only gets a
 notice.
 
-Prints counts, model names and file paths only, never transcript text: the
-logs of a public repo are public.
+Prints counts, model names, file paths and the first line of up to three
+distinct Bash errors (token-shaped text redacted), never other transcript
+text: the logs of a public repo are public.
 
 Usage: review_coverage.py <execution_file> <changed_files.txt>
   changed_files.txt: one path per line, as `gh api .../pulls/N/files` lists them
@@ -44,6 +45,8 @@ GH_API_POST = re.compile(
     r"\bgh api\b(?=.*/(comments|reviews)\b)(?=.*(\s-X\s*POST|\s--method\s+POST|\s-[fF]\s|\s--(raw-)?field|\s--input))"
 )
 INLINE_COMMENT = "mcp__github_inline_comment__create_inline_comment"
+# Anything token-shaped is cut from the error lines this prints.
+SECRET = re.compile(r"(sk-ant-|gh[pousr]_|github_pat_)[\w-]+|[A-Za-z0-9+/=_-]{32,}")
 
 
 def blocks(messages):
@@ -90,13 +93,17 @@ def main():
             c = b.get("content")
             results[b.get("tool_use_id")] = (c if isinstance(c, str) else json.dumps(c), bool(b.get("is_error")))
 
-    reads, shown, agents, posted, bash_failed = set(), [], [], False, 0
+    reads, shown, agents, posted, bash_failed, errors = set(), [], [], False, 0, []
     for use_id, (name, inp) in uses.items():
         output, failed = results.get(use_id, ("", True))
         if name == "Agent":
             agents.append(f"{inp.get('model') or 'default'}: {inp.get('description', '')}")
         if failed:  # denied or errored: nothing was shown, nothing was posted
-            bash_failed += name == "Bash"
+            if name == "Bash":
+                bash_failed += 1
+                first = SECRET.sub("[redacted]", (output.strip().splitlines() or [""])[0])[:160]
+                if first not in errors:
+                    errors.append(first)
             continue
         if name == "Read":
             reads.add(inp.get("file_path", ""))
@@ -128,6 +135,9 @@ def main():
         # every Bash call failing means the shell itself is broken (for
         # example the env scrub's bwrap sandbox can't start), not the review
         f"Bash calls failed: {bash_failed} of {sum(1 for n, _ in uses.values() if n == 'Bash')}",
+        # the first line of each distinct error, token-shaped text redacted,
+        # so a broken shell can be diagnosed without the hidden transcript
+        *(f"Bash error: `{e}`" for e in errors[:3]),
     ]
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
