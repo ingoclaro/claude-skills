@@ -30,6 +30,12 @@ jobs:
         with:
           fetch-depth: 1
 
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (below) runs each Bash command in a
+      # bubblewrap sandbox, and Claude Code won't start without it. The
+      # runner image doesn't ship it.
+      - name: Install bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
