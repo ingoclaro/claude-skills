@@ -88,6 +88,23 @@ class GapProven(unittest.TestCase):
         )
         self.assertFalse(g.gap_proven(run)[0])
 
+    def test_rewritten_by_a_heredoc_with_the_redirect_last(self):
+        body = json.dumps([RULE], indent=2)
+        run = FakeRun(
+            write("/r/m.json", [OTHER]),
+            bash(f"cat <<'EOF' > /r/m.json\n{body}\nEOF"),
+            bash("bun mutate.ts /r/m.json", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
+    def test_rewritten_by_echo(self):
+        run = FakeRun(
+            write("/r/m.json", [OTHER]),
+            bash(f"echo '{json.dumps([RULE])}' > /r/m.json"),
+            bash("bun mutate.ts /r/m.json", "SURVIVED    threshold: all tests passed"),
+        )
+        self.assertTrue(g.gap_proven(run)[0])
+
     def test_run_through_a_wrapper_that_never_names_the_script(self):
         run = FakeRun(
             write("/r/m.json", [RULE]),

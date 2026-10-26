@@ -147,7 +147,12 @@ async function copyRepo(): Promise<string> {
   const dir = await realpath(copyDir)
     .then(async (d) => (await Bun.write(join(d, ".probe"), "ok"), (await Bun.file(join(d, ".probe")).text()) === "ok" ? d : Promise.reject("not readable back")))
     .catch(unusable);
-  for (let i = 0; i < files.length; i += 64) await Promise.all(files.slice(i, i + 64).map((f) => copyEntry(dir, f)));
+  // allSettled: a failed copy waits for the rest of its batch, so nothing still
+  // writing can recreate the copy after fail() removes it.
+  for (let i = 0; i < files.length; i += 64) {
+    const failed = (await Promise.allSettled(files.slice(i, i + 64).map((f) => copyEntry(dir, f)))).find((r) => r.status === "rejected");
+    if (failed) throw (failed as PromiseRejectedResult).reason;
+  }
   await symlink(join(root, "node_modules"), join(dir, "node_modules")).catch(() => {});
   return dir;
 }
