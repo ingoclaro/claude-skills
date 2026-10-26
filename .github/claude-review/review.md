@@ -25,8 +25,9 @@ gh api graphql -F o={{owner}} -F r={{name}} -F n={{pr}} -f query='
   }'
 ```
 
-Only the unresolved ones matter, and of those, only the ones on a file in
-this list, the files this review covers:
+In this part, only the unresolved ones matter, and of those only the ones
+on a file in this list, the files this review covers. Keep the resolved ones
+for part 2.
 
 {{changed_files}}
 
@@ -45,11 +46,16 @@ later comment from a person already settled it, for example by saying the
 behaviour is deliberate. Reply with:
 
 ```
-gh api repos/{{repo}}/pulls/{{pr}}/comments/<databaseId of the thread's first comment>/replies -f body='...'
+gh api repos/{{repo}}/pulls/{{pr}}/comments/<databaseId of the thread's first comment>/replies -F body=@- <<'REPLY_END'
+<the reply>
+REPLY_END
 ```
 
-and start the reply with `Addressed in <short sha>:`, `Still open after
+Start the reply with `Addressed in <short sha>:`, `Still open after
 <short sha>:` or `Unclear after <short sha>:`, followed by one line on why.
+Pass the text on standard input with a quoted heredoc, as shown, never
+inside quotes on the command line: replies are ordinary sentences, and an
+apostrophe ("doesn't") would end a quoted argument.
 Don't try to resolve threads: this job's token isn't allowed to, so a
 person resolves them.
 
@@ -58,9 +64,14 @@ person resolves them.
 Invoke the `code-review` skill with the arguments `high {{target}}`. This
 reviews {{target_description}}.
 
-Take its findings and drop every one that an unresolved thread from part 1
-already raises, whether or not that thread is on a file listed above, so
-nothing is reported twice. Post each remaining finding as an inline comment
+Take its findings and drop every one that a thread from part 1 already
+raises, whether or not that thread is on a file listed above, so nothing is
+reported twice. That includes resolved threads: a person resolved them,
+either because the finding was fixed or because they decided it doesn't
+apply, and either way it shouldn't come back. The one exception is a
+regression: if a resolved thread's latest `github-actions` reply said
+`Addressed in …` and the problem is now back, post it as a new finding that
+says so and links the earlier thread. Post each remaining finding as an inline comment
 on the line it is about in the head commit, with
 `mcp__github_inline_comment__create_inline_comment` and `confirmed: true`.
 If the API rejects a line, for example because it isn't part of the diff,
