@@ -77,6 +77,16 @@ class Coverage(unittest.TestCase):
         reads = call("r", "Read", {"file_path": "/repo/docs/README.md"}) + bash("c", "cat /repo/docs/README.md")
         self.assertSeen(reads, ["README.md"], 0)
 
+    def test_a_saved_diff_read_back_with_line_numbers_counts(self):
+        # Claude Code saves a large diff to a file; Read shows it as "<n>\t<line>"
+        saved = bash("d", "gh pr diff 7", "<persisted-output>\nOutput too large (87.8KB). Full output saved to: /x/t.txt")
+        read = call("r", "Read", {"file_path": "/x/t.txt", "offset": 370, "limit": 40},
+                    "370\t+x\n373\tdiff --git a/evals/grade.py b/evals/grade.py\n374\tindex 0..1\n")
+        self.assertSeen(saved + read, ["evals/grade.py"], 1)
+
+    def test_cat_n_output_counts(self):
+        self.assertSeen(bash("c", "cat -n /tmp/pr.diff", "    12\tdiff --git a/a.py b/a.py\n"), ["a.py"], 1)
+
     def test_a_listing_of_diff_headers_does_not_count(self):
         # grep -n '^diff' prints the header with a line number, not the change itself
         self.assertSeen(bash("g", "grep -n '^diff' /tmp/pr.diff", "51:diff --git a/a.py b/a.py\n"), ["a.py"], 0)

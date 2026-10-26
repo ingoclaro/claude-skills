@@ -14,9 +14,12 @@ A changed file reached the review if:
   for `a.py`, and `/repo/docs/README.md` doesn't count for `README.md`. A
   partial read counts: the check is that the file was shown, not how much.
 
-A listing of diff headers (`grep -n '^diff' pr.diff`) shows `51:diff --git
-a/f b/f` but not the file's change, so a header only counts at the start of
-a line.
+A large `gh pr diff` output is often saved to a file that the review then
+reads with `Read`, which prefixes each line with its number and a tab
+(`373\tdiff --git a/f b/f`), as `cat -n` does, so a header counts at the start of
+a line or after such a prefix. A listing of headers (`grep -n '^diff'
+pr.diff` prints `51:diff --git a/f b/f`) doesn't show the file's change, so
+it doesn't count.
 
 A file name alone, as in `gh pr view --json files`, doesn't count.
 
@@ -114,7 +117,7 @@ def main():
 
     text = "\n".join(out for out, failed in results.values() if not failed)
     seen = [f for f in changed
-            if re.search(rf'^diff --git .* "?b/{re.escape(f)}"?$', text, re.M)
+            if re.search(rf'^(\s*\d+\t)?diff --git .* "?b/{re.escape(f)}"?$', text, re.M)
             or any(names(f, r, root) for r in reads)
             or any(mentions(f, c, root) for c in shown)]
     missed = [f for f in changed if f not in seen]
