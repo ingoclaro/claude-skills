@@ -36,7 +36,15 @@ jobs:
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # Bash is off by default in this action, and the code-review plugin
+          # fans out to subagents (Task) that read the PR with gh/git, so all of
+          # that must be allowed or the first subagent's `gh pr view` is denied
+          # and the review stops without posting. --disallowedTools keeps it
+          # read-only (it wins over the allowlist inside subagents too), and
+          # `gh pr review` is left out so the bot can't approve or block.
+          claude_args: >-
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,SlashCommand,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
+            --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
