@@ -3,15 +3,18 @@
      100 threads, so a pull request with more isn't fully followed up. -->
 You are reviewing pull request #{{pr}} in {{repo}}. {{situation}} The working
 tree is the pull request's head commit, {{after}}, with the whole history, so
-line numbers you read from it are the ones inline comments target.
+line numbers you read from it are the ones inline comments target. Below,
+`<sha>` means the first 7 characters of {{after}}.
 
-Do the two parts below, in order, then stop. Don't edit any file and don't
-push. Post on GitHub only in the ways described here.
+Your output is the replies and inline comments described below, then a
+summary; the working tree and the branch stay as they are. Do part 1, then
+part 2, then stop.
 
-## 1. Earlier findings
+## Threads
 
-Earlier reviews of this pull request left their findings as review threads,
-the ones whose first comment is by `github-actions`. List them:
+Earlier reviews left their findings as review threads. A **bot thread** is
+one whose first comment is by `github-actions`; only bot threads matter here.
+List them:
 
 ```
 gh api graphql -F o={{owner}} -F r={{name}} -F n={{pr}} -f query='
@@ -26,27 +29,40 @@ gh api graphql -F o={{owner}} -F r={{name}} -F n={{pr}} -f query='
   }'
 ```
 
-`first` is the finding; `latest` holds the newest replies. In this part,
-check every unresolved thread, not only those on a file this review covers:
-a finding can be fixed by a change to another file. Threads on these files,
-the ones this review covers, are the most likely to have changed:
+`first` is the finding; `latest` holds the newest replies. A `line` of null
+means the thread is outdated: the lines moved, and the finding is about
+wherever that code is now.
+
+- A thread's **verdict** is its latest `github-actions` reply that starts
+  with one of the prefixes in part 1, if it has one.
+- A thread is **settled** when a person commented on it that the finding
+  doesn't apply or the behaviour is deliberate, for example after reverting
+  a fix on purpose. A settled thread is finished: it gets no reply, and its
+  finding is never reported again.
+- A thread **raises** a finding when it is about the same problem in the
+  same code. The same kind of problem elsewhere is a new finding.
+
+## 1. Earlier findings
+
+Check every bot thread that is unresolved, and every resolved one with no
+verdict yet. Threads on the files this review covers are the most likely to
+have changed, but a finding can also be fixed by a change to another file:
 
 {{changed_files}}
 
-Keep the resolved threads for part 2. For each unresolved thread, read its
-finding and the code it is about as it is now, and decide which of these is
-true:
+Skip settled threads. For each of the others, read the finding and the code
+it is about as it is now, and pick the prefix that is true:
 
-- **Fixed**: the problem is gone.
-- **Still there**: the problem remains. A thread whose `line` is null is
-  outdated, which only means the lines moved, so check it the same way.
-- **Can't tell**: you'd need something you can't check.
+- `Addressed in <sha>:` the problem is gone.
+- `Still open after <sha>:` the problem remains.
+- `Unclear after <sha>:` deciding needs something you can't check.
 
-Then compare that with the thread's latest reply by `github-actions`, if
-there is one. Reply only when your verdict is new or differs from it, so a
-push doesn't repeat what the thread already says. Leave a thread alone if a
-later comment from a person already settled it, for example by saying the
-behaviour is deliberate. Reply with:
+Reply when the prefix differs from the thread's verdict, or the thread has
+none, so each push adds only what changed. A resolved thread gets a reply
+only with `Addressed in`, which records the fix so a later return of the
+problem counts as a regression in part 2; a resolved thread whose problem
+remains was resolved on purpose, so treat it as settled. Follow the prefix
+with one line on why, and post it with:
 
 ```
 gh api repos/{{repo}}/pulls/{{pr}}/comments/<databaseId of the thread's first comment>/replies -F body=@- <<'REPLY_END'
@@ -54,42 +70,37 @@ gh api repos/{{repo}}/pulls/{{pr}}/comments/<databaseId of the thread's first co
 REPLY_END
 ```
 
-Start the reply with `Addressed in <short sha>:`, `Still open after
-<short sha>:` or `Unclear after <short sha>:`, followed by one line on why.
-Pass the text on standard input with a quoted heredoc, as shown, never
-inside quotes on the command line: replies are ordinary sentences, and an
-apostrophe ("doesn't") would end a quoted argument.
-Don't try to resolve threads: this job's token isn't allowed to, so a
-person resolves them.
+Keep that form for every reply: the quoted heredoc passes the text on
+standard input, so an apostrophe in it ("doesn't") is safe. A person
+resolves threads; this job's token can't.
+
+Part 1 is done when every checked thread is settled, has a reply from this
+run, or already has the verdict you reached.
 
 ## 2. New findings
 
 Invoke the `code-review` skill with the arguments `high {{target}}`. This
-reviews {{target_description}}.
+reviews {{target_description}}. Sort each of its findings into the first of
+these that fits:
 
-Take its findings and drop every one that a thread from part 1 already
-raises, so nothing is reported twice. A thread raises a finding only if it
-is about the same problem in the same code; the same kind of problem
-elsewhere, for example in a file the thread isn't about, is a new finding.
+- **Regression**: a resolved bot thread that isn't settled raises it, and
+  that thread's verdict starts with `Addressed in`. The fix is gone again:
+  post it, say it is a regression, and link that thread.
+- **Duplicate**: any other bot thread raises it, resolved or not. Drop it;
+  that thread already carries it.
+- **New**: post it.
 
-That includes resolved threads: a person resolved them, either because the
-finding was fixed or because they decided it doesn't apply, and either way
-it shouldn't come back. The one exception is a regression: the finding was
-fixed, and the problem is back. Count it as one only if the thread's latest
-`github-actions` reply says `Addressed in …`, or, in a follow-up review,
-these commits changed the very lines whose earlier change fixed it. A person
-may resolve a thread without a comment because they decided the finding
-doesn't apply, so a later edit near the same code is not enough. Even
-then, drop it if a person commented on that thread, after the bot's reply,
-that the finding doesn't apply or the behaviour is deliberate, for example
-when they reverted the fix on purpose. Post a regression as a new finding
-that says so and links the earlier thread.
-
-Post each remaining finding as an inline comment
-on the line it is about in the head commit, with
+Post each finding as an inline comment on the line it is about, with
 `mcp__github_inline_comment__create_inline_comment` and `confirmed: true`.
 If the API rejects a line, for example because it isn't part of the diff,
 put the finding on the nearest changed line it concerns and name the real
 location in the comment.
 
-End with a short summary: replies posted by kind, and new findings posted.
+Part 2 is done when every finding from the skill is posted or dropped as a
+duplicate.
+
+## Summary
+
+End with: the replies posted, counted by prefix; the findings posted, with
+regressions marked; and the findings dropped as duplicates, each with the
+thread that raises it.
