@@ -1,10 +1,14 @@
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { $ } from "bun";
 import { join } from "node:path";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 const script = join(import.meta.dir, "../../skills/adversarial-review/scripts/mutate.ts");
+
+// Each case runs git, the script and the suite at least twice; bun's 5 s
+// default would fail a slow runner before an assertion could.
+setDefaultTimeout(30_000);
 
 // Every temp dir a test makes, removed at the end. Honours TMPDIR, for
 // sandboxes where /tmp isn't writable.
@@ -113,9 +117,12 @@ test("exits 3, not 1, when the script itself can't run, so it isn't read as a su
   expect(badTmp.out).toContain("pass a writable --tmp");
   const notArray = await mutate(dir, { name: "minus" });
   expect(notArray.code).toBe(3);
-  expect(notArray.out).toContain("expected a JSON array");  const badTimeout = await mutate(dir, minus, "bun test", ["--timeout", "abc"]);
+  expect(notArray.out).toContain("expected a JSON array");
+  const badTimeout = await mutate(dir, minus, "bun test", ["--timeout", "abc"]);
   expect(badTimeout.code).toBe(3);
   expect(badTimeout.out).toContain("--timeout");
+  const huge = await mutate(dir, minus, "bun test", ["--timeout", "Infinity"]);
+  expect(huge.code).toBe(3);
   const noCommits = await tempDir();
   await Bun.write(join(noCommits, "add.ts"), add["add.ts"]);
   await $`git init -q`.cwd(noCommits);
@@ -164,4 +171,46 @@ test("a mutant that hangs times out and counts as caught", async () => {
   const { code, out } = await mutate(dir, hang, "bun test", ["--timeout", "2"]);
   expect(out).toMatch(/TIMEOUT\s+hang/);
   expect(code).toBe(0);
+});
+
+test("a suite that passes but leaves a process running is a pass, not a timeout", async () => {
+  // The background sleep holds the output pipes open after sh exits.
+  const dir = await repo(add);
+  const comment = [{ name: "comment only", file: "add.ts", find: "export const", replace: "/* x */ export const" }];
+  const start = Date.now();
+  const { out } = await mutate(dir, comment, "bun test; sleep 30 &", ["--all", "--timeout", "10"]);
+  expect(out).toMatch(/SURVIVED\s+comment only/);
+  expect(Date.now() - start).toBeLessThan(10_000);
+});
+
+test("symlinks out of the repo are followed for reading but never written through", async () => {
+  const outside = await tempDir();
+  await Bun.write(join(outside, "lib.ts"), "export const one = 1;\n");
+  const dir = await repo({
+    ...add,
+    "one.test.ts": 'import { test, expect } from "bun:test";\nimport { one } from "./base";\ntest("one", () => expect(one).toBe(1));\n',
+  });
+  await symlink(join(outside, "lib.ts"), join(dir, "base.ts")); // copied: the copy can't reach it by a relative path
+  await symlink(outside, join(dir, "shared")); // linked by absolute path
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm links`.cwd(dir);
+  const { out } = await mutate(dir, [{ name: "through", file: "shared/lib.ts", find: "= 1", replace: "= 2" }], "bun test", ["--all"]);
+  expect(out).toMatch(/NOT APPLIED\s+through: shared\/lib.ts is behind a symlink out of the repo/);
+  expect(await Bun.file(join(outside, "lib.ts")).text()).toBe("export const one = 1;\n");
+});
+
+test("an interrupt kills the running tests and removes the copy", async () => {
+  const dir = await repo(add);
+  const tmp = join(await tempDir(), "copies");
+  await mkdir(tmp);
+  const json = join(await tempDir(), "mutants.json");
+  await Bun.write(json, "[]");
+  const marker = `sleep ${3000 + Math.floor(Math.random() * 1000)}`;
+  const proc = Bun.spawn(["bun", script, json, "--cmd", marker, "--all", "--tmp", tmp], { cwd: dir, stdout: "ignore", stderr: "ignore" });
+  await Bun.sleep(1500);
+  expect((await $`pgrep -f ${marker}`.nothrow().quiet()).exitCode).toBe(0); // the baseline is running
+  proc.kill("SIGTERM");
+  expect(await proc.exited).toBe(3);
+  await Bun.sleep(200);
+  expect((await $`pgrep -f ${marker}`.nothrow().quiet()).exitCode).toBe(1);
+  expect(await readdir(tmp)).toEqual([]);
 });

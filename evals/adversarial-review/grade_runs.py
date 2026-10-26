@@ -206,12 +206,12 @@ def probe_tests(command):
     """File names of the probes a command runs through the test runner.
 
     A probe is a `bun test` path argument in a temp dir or named probe/repro,
-    from any `bun test` in the command, past any flags. A suite run (`bun test
+    from any `bun test` in the command, past any prefix (`timeout 30`) or flags. A suite run (`bun test
     src/`) names none.
     """
     names = []
     for seg in re.split(r"&&|\|\||[;|\n]", command):
-        m = re.match(r"\s*bun\s+test\b(.*)", seg)
+        m = re.search(r"\bbun\s+test\b(.*)", seg)
         if m:
             names += [t.strip("'\"").rsplit("/", 1)[-1] for t in m.group(1).split()
                       if not t.startswith("-") and re.search(r"/tmp|tmp/|probe|repro", t)]
@@ -240,26 +240,54 @@ def names_rollover_gap(run):
     return (True, snippet(run.text, m)) if m else (False, "the rollover rule is never tied to missing tests")
 
 
-def rule_mutants(run):
-    """Names of the mutants written to mutate.ts whose "find" is in the rollover rule."""
-    names = set()
-    for n, i, _ in run.tools:
-        text = i.get("content", "") if n == "Write" else i.get("command", "") if n == "Bash" else ""
+# A mutant's "find" in the rollover rule: its condition, or its block, which
+# unlike the loop's `unit++` is followed by the return.
+RULE_FIND = r"1023\.95|unit > 0|unit\+\+;\s*\}\s*return"
+
+
+def mutant_objects(text):
+    """The mutant objects in a mutants file, or in a command that writes one."""
+    # The whole text, then the span from the first "[" to the last "]": a
+    # heredoc or echo around the JSON.
+    for cand in (text, *re.findall(r"\[[\s\S]*\]", text)):
         try:
-            objs = json.loads(text)
+            objs = json.loads(cand)
         except (json.JSONDecodeError, TypeError):
-            # a mutants file written by a shell command: its flat objects
-            objs = []
-            for m in re.finditer(r"\{[^{}]*\}", text):
-                try:
-                    objs.append(json.loads(m.group(0)))
-                except json.JSONDecodeError:
-                    pass
-        for m in objs if isinstance(objs, list) else [objs]:
-            if (isinstance(m, dict) and isinstance(m.get("name"), str)
-                    and re.search(r"1023\.95|unit > 0", str(m.get("find", "")))):
-                names.add(m["name"])
-    return names
+            continue
+        return [o for o in (objs if isinstance(objs, list) else [objs]) if isinstance(o, dict)]
+    # Not valid JSON as a whole: its flat objects.
+    objs = []
+    for m in re.finditer(r"\{[^{}]*\}", text):
+        try:
+            objs.append(json.loads(m.group(0)))
+        except json.JSONDecodeError:
+            pass
+    return objs
+
+
+def rule_mutants(run):
+    """Names of the mutants written for mutate.ts whose "find" is in the rollover rule.
+
+    Mutants files are followed through Write and Edit, so an edited file is
+    read as it stands after the edit; Bash commands are read as written.
+    """
+    files, texts = {}, []
+    for n, i, _ in run.tools:
+        if n == "Write":
+            files[i.get("file_path")] = i.get("content", "")
+            texts.append(files[i.get("file_path")])
+        elif n == "Edit":
+            path = i.get("file_path")
+            old, new = i.get("old_string", ""), i.get("new_string", "")
+            if path in files:
+                files[path] = files[path].replace(old, new, -1 if i.get("replace_all") else 1)
+                texts.append(files[path])
+            else:
+                texts.append(new)
+        elif n == "Bash":
+            texts.append(i.get("command", ""))
+    return {m["name"] for t in texts for m in mutant_objects(t)
+            if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", "")))}
 
 
 def gap_proven(run):

@@ -10,8 +10,8 @@
 // --all, or a commit that touches no test files, runs --cmd as given (needed
 // when the runner takes packages rather than files, like `go test ./...`).
 // Mutants run one at a time in a single copy of the repo (tracked + untracked
-// files, symlinks kept as symlinks, submodules and nested repos left out,
-// node_modules symlinked), with each mutated file restored after its run, so
+// files, symlinks within the repo kept as symlinks, submodules and nested repos
+// left out, node_modules symlinked), with each mutated file restored after its run, so
 // the working tree is never touched. The copy goes under --tmp (default: the
 // system temp dir), for sandboxes where /tmp isn't writable.
 // Exit codes: 0 every mutant caught. 1 any mutant survived or couldn't be
@@ -24,8 +24,9 @@
 import { $ } from "bun";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { mkdtemp, mkdir, rm, symlink, copyFile, lstat, readlink } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { rmSync } from "node:fs";
+import { mkdtemp, mkdir, rm, symlink, copyFile, lstat, readlink, realpath, stat } from "node:fs/promises";
 
 type Mutant = { name: string; file: string; find: string; replace: string };
 type Result = { name: string; outcome: "caught" | "SURVIVED" | "NOT APPLIED" | "TIMEOUT"; detail: string };
@@ -48,7 +49,9 @@ const fail = (what: string, e: unknown): never => {
 };
 const baseCmd = flag("--cmd", "bun test");
 const timeoutSec = Number(flag("--timeout", "60"));
-if (!(timeoutSec > 0)) fail("reading --timeout", `expected a number of seconds, got ${flag("--timeout", "60")}`);
+// setTimeout fires at once past 2^31-1 ms, so that's the cap.
+if (!(timeoutSec > 0 && timeoutSec <= 2147483))
+  fail("reading --timeout", `expected a number of seconds up to 2147483, got ${flag("--timeout", "60")}`);
 const tmpRoot = flag("--tmp", tmpdir());
 const mutants: Mutant[] = await Bun.file(mutantsPath).json().catch((e) => fail(`reading ${mutantsPath}`, e));
 if (!Array.isArray(mutants)) fail(`reading ${mutantsPath}`, "expected a JSON array of mutants");
@@ -69,15 +72,27 @@ const files = (await $`git -C ${root} ls-files -co --exclude-standard -z`.quiet(
   .split("\0")
   .filter(Boolean);
 
-// A symlink is recreated as one, even when it dangles. A directory is a
-// submodule or a nested repo: left out. Copies run in batches, so a large repo
-// doesn't run out of file descriptors.
+const inside = (base: string, path: string) => {
+  const rel = relative(base, path);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+};
+
+// A directory is a submodule or a nested repo: left out. A symlink to a path in
+// the repo is recreated relative, so it points into the copy, even when it
+// dangles. One that leaves the repo can't be followed from the copy's place:
+// a file it points to is copied, anything else is linked by absolute path.
+// Copies run in batches, so a large repo doesn't run out of file descriptors.
 async function copyEntry(dir: string, f: string) {
-  const stat = await lstat(join(root, f));
-  if (stat.isDirectory()) return;
-  await mkdir(join(dir, f, ".."), { recursive: true });
-  if (stat.isSymbolicLink()) await symlink(await readlink(join(root, f)), join(dir, f));
-  else await copyFile(join(root, f), join(dir, f));
+  const src = join(root, f);
+  const dst = join(dir, f);
+  const st = await lstat(src);
+  if (st.isDirectory()) return;
+  await mkdir(dirname(dst), { recursive: true });
+  if (!st.isSymbolicLink()) return copyFile(src, dst);
+  const target = resolve(dirname(src), await readlink(src));
+  if (inside(root, target)) return symlink(relative(dirname(src), target), dst);
+  if ((await stat(target).catch(() => null))?.isFile()) return copyFile(target, dst);
+  await symlink(target, dst);
 }
 
 async function copyRepo(): Promise<string> {
@@ -90,24 +105,48 @@ async function copyRepo(): Promise<string> {
   return dir;
 }
 
+// The copy and the running test group, for the interrupt handler below.
+let copyDir: string | undefined;
+let group: number | undefined;
+const killGroup = (pid: number) => {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {}
+};
+// The test group is detached, so an interrupt to this script doesn't reach it:
+// kill it and remove the copy here, or a hung mutant keeps running.
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
+  process.on(sig, () => {
+    if (group) killGroup(group);
+    if (copyDir) rmSync(copyDir, { recursive: true, force: true });
+    process.exit(3);
+  });
+
 // The test command runs in its own process group, and a timeout kills the
 // whole group: killing only `sh` would leave the runner holding the pipes open.
-// Both streams are read as they arrive, so a full stderr can't block the run.
+// The result is `sh`'s exit; anything it leaves running (a server, a watcher)
+// is killed then, so its open pipes can't turn a pass into a timeout. Both
+// streams are read as they arrive, so a full stderr can't block the run.
 function runTests(dir: string): Promise<{ code: number; timedOut: boolean; output: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("sh", ["-c", testCmd], { cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    group = child.pid;
     let output = "";
+    let exitCode: number | undefined;
     let timedOut = false;
-    child.stdout.on("data", (d) => (output += d));
-    child.stderr.on("data", (d) => (output += d));
+    child.stdout.setEncoding("utf8").on("data", (d) => (output += d));
+    child.stderr.setEncoding("utf8").on("data", (d) => (output += d));
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {}
+      killGroup(child.pid!);
     }, timeoutSec * 1000);
-    child.on("error", (e) => (clearTimeout(timer), reject(e)));
-    child.on("close", (code) => (clearTimeout(timer), resolve({ code: code ?? 1, timedOut, output })));
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      exitCode = code ?? 1;
+      killGroup(child.pid!);
+    });
+    child.on("error", (e) => (clearTimeout(timer), (group = undefined), reject(e)));
+    child.on("close", () => ((group = undefined), resolve({ code: exitCode ?? 1, timedOut, output })));
   });
 }
 
@@ -119,6 +158,10 @@ async function run(m: Mutant, dir: string): Promise<Result> {
   if (source === null) return { name, outcome: "NOT APPLIED", detail: `no such file: ${m.file}` };
   const count = source.split(m.find).length - 1;
   if (count !== 1) return { name, outcome: "NOT APPLIED", detail: `"find" matched ${count} times in ${m.file}` };
+  // Behind a symlink out of the repo, writing the mutant would change the real file.
+  const real = await realpath(join(dir, m.file)).catch(() => null);
+  if (!real || !inside(await realpath(dir), real))
+    return { name, outcome: "NOT APPLIED", detail: `${m.file} is behind a symlink out of the repo` };
   try {
     // A function, so "$&" or "$$" in the replace text is written as is.
     await Bun.write(join(dir, m.file), source.replace(m.find, () => m.replace));
@@ -135,6 +178,7 @@ async function run(m: Mutant, dir: string): Promise<Result> {
 
 // One copy, mutants run one at a time.
 const dir = await copyRepo().catch((e) => fail("copying the repo", e));
+copyDir = dir;
 const results: Result[] = [];
 let crashed: unknown;
 try {
@@ -143,7 +187,7 @@ try {
   if (timedOut) throw new Error(`the unmutated tests gave no result in ${timeoutSec}s (raise --timeout)`);
   if (code !== 0) {
     console.error(`The unmutated tests fail in a copy of the repo (exit ${code}), so every mutant would look caught: ${testCmd}`);
-    console.error("The copy has tracked and untracked files plus node_modules; ignored files (.env, .venv, build output) are missing.");
+    console.error("The copy has tracked and untracked files plus node_modules; ignored files (.env, .venv, build output) and the contents of submodules and nested repos are missing.");
     console.error(`Fix the test command with --cmd (or pass --all if the runner can't take file paths), or make the tests runnable from a clean checkout. Last output:\n${output.split("\n").slice(-15).join("\n")}`);
     process.exitCode = 2;
   } else {
