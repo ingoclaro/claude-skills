@@ -2,7 +2,10 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    # Not on every push (synchronize): each review is a full one, so later
+    # pushes would each cost another. Comment `@claude review this PR` to
+    # get a review after changes.
+    types: [opened, ready_for_review, reopened]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -66,17 +69,21 @@ jobs:
           # token. That also skips the app's "workflow must match main" check,
           # so a PR that changes this file is reviewed by the changed version.
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # Claude Code's bundled /code-review, not the older code-review
+          # plugin (/code-review:code-review). Its effort level trades
+          # confidence for coverage (low: only the surest findings; medium to
+          # max: broader), where the plugin only ever reported bugs that fail
+          # regardless of input. --comment posts the findings inline.
+          # https://code.claude.com/docs/en/code-review-local
+          prompt: '/code-review high --comment ${{ github.event.pull_request.number }}'
           # Nothing can approve a permission prompt here, so a denied tool call
           # just fails. Bash is off by default, and the model chains commands
           # (`gh pr diff > f; grep ...`, `gh api`, `git ls-files | grep`) that
           # prefix rules like Bash(gh pr diff:*) can't match, so all of Bash is
           # allowed; the token's permissions above are the real boundary.
-          # Opus runs the plugin's subagent fan-out reliably; Sonnet, the
-          # default, often skips it and answers "no issues" after a shallow
-          # read. Denying `gh pr review` only stops the obvious way to approve:
+          # Opus, because Sonnet, the default, cut multi-step reviews short
+          # and answered "no issues" after a shallow read in local tests.
+          # Denying `gh pr review` only stops the obvious way to approve:
           # `gh api .../reviews` still gets past it. What actually stops the
           # bot approving is the job token plus the repo's default setting
           # that doesn't let Actions approve pull requests.
@@ -87,9 +94,9 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
-      # The plugin posts the same "No issues found" comment whether it read
-      # the whole diff or two files, so check the transcript: a posted review
-      # fails this step if any changed file never reached it.
+      # A review's comment reads the same whether it read the whole diff or
+      # two files, so check the transcript: a posted review fails this step
+      # if any changed file never reached it.
       - name: Check the review saw every changed file
         if: always() && steps.claude-review.outputs.execution_file != ''
         env:

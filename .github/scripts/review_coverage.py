@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check that a posted Claude review is backed by the files it was shown.
 
-The code-review plugin posts the same fixed comment ("No issues found.
-Checked for bugs and CLAUDE.md compliance.") whether it reviewed the whole
-diff or skimmed two files, so the comment can't tell you. The transcript can.
+A review's comment reads the same whether it reviewed the whole diff or
+skimmed two files (the old code-review plugin even posted a fixed "No issues
+found" template), so the comment can't tell you. The transcript can.
 A changed file reached the review if:
 
 - its diff header appeared in some tool output (`gh pr diff`, `git diff`),
@@ -26,9 +26,8 @@ A file name alone, as in `gh pr view --json files`, doesn't count.
 Rule: if the run posted anything (`gh pr comment`, a comment or review made
 through `gh api`, or an inline comment) and the call succeeded, every changed
 file must have reached the review, or this exits 1 and names the files it
-never saw. A run that posted nothing (the plugin stops early on closed, draft,
-trivial or already-reviewed PRs) published no verdict, so it only gets a
-notice.
+never saw. A run that posted nothing (no findings to post, or a review that
+stopped early) published no verdict, so it only gets a notice.
 
 Prints counts, model names, file paths and the first line of up to three
 distinct Bash errors (token-shaped text redacted), never other transcript
@@ -149,7 +148,7 @@ def main():
     print(verdict, *lines, sep="\n")
 
     if not posted:
-        print("::notice::The review posted nothing (it stops early on closed, draft, trivial or already-reviewed PRs).")
+        print("::notice::The review posted nothing: no findings to post, or it stopped early.")
     elif missed:
         print(f"::error::The posted review never saw {len(missed)} of {len(changed)} changed files: {', '.join(missed)}")
         sys.exit(1)
