@@ -24,9 +24,9 @@
 import { $ } from "bun";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { rmSync } from "node:fs";
-import { mkdtemp, mkdir, rm, symlink, copyFile, lstat, readlink, realpath, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, copyFile, lstat, readlink, realpath, stat } from "node:fs/promises";
 
 type Mutant = { name: string; file: string; find: string; replace: string };
 type Result = { name: string; outcome: "caught" | "SURVIVED" | "NOT APPLIED" | "TIMEOUT"; detail: string };
@@ -41,9 +41,16 @@ if (!mutantsPath || mutantsPath.startsWith("--")) {
   console.error('usage: bun <skill dir>/scripts/mutate.ts <mutants.json> [--cmd "bun test"] [--all] [--timeout 60] [--tmp <dir>]');
   process.exit(3);
 }
+// The repo copy, once made. Every way out of the script removes it.
+let copyDir: string | undefined;
+const cleanup = () => {
+  if (copyDir) rmSync(copyDir, { recursive: true, force: true });
+  copyDir = undefined;
+};
 // Anything that stops the script itself exits 3, so it can't be read as exit 1
 // ("a mutant survived").
 const fail = (what: string, e: unknown): never => {
+  cleanup();
   console.error(`mutate.ts could not run: ${what}: ${e instanceof Error ? e.message : e}`);
   process.exit(3);
 };
@@ -72,8 +79,7 @@ const files = (await $`git -C ${root} ls-files -co --exclude-standard -z`.quiet(
   .split("\0")
   .filter(Boolean);
 
-// The copy and the running test group, for the interrupt handler below.
-let copyDir: string | undefined;
+// The running test group, for the interrupt handler below.
 let group: number | undefined;
 const killGroup = (pid: number) => {
   try {
@@ -85,7 +91,7 @@ const killGroup = (pid: number) => {
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
   process.on(sig, () => {
     if (group) killGroup(group);
-    if (copyDir) rmSync(copyDir, { recursive: true, force: true });
+    cleanup();
     process.exit(3);
   });
 
@@ -98,7 +104,8 @@ const inside = (base: string, path: string) => {
 
 // A directory is a submodule or a nested repo: left out. A symlink to a path in
 // the repo is recreated relative, so it points into the copy, even when it
-// dangles. One that leaves the repo can't be followed from the copy's place:
+// dangles. Only its directory is resolved, not the link chain: a.ts -> b.ts
+// stays a link to b.ts whatever b.ts is. One that leaves the repo can't be followed from the copy's place:
 // a file it points to is copied, anything else is linked by absolute path.
 // Copies run in batches, so a large repo doesn't run out of file descriptors.
 async function copyEntry(dir: string, f: string) {
@@ -109,19 +116,20 @@ async function copyEntry(dir: string, f: string) {
   await mkdir(dirname(dst), { recursive: true });
   if (!st.isSymbolicLink()) return copyFile(src, dst);
   const raw = resolve(dirname(src), await readlink(src));
-  const target = await realpath(raw).catch(() => raw); // a dangling link keeps its own path
-  if (inside(root, target)) return symlink(relative(dirname(src), target), dst);
+  const target = join(await realpath(dirname(raw)).catch(() => dirname(raw)), basename(raw));
+  // "" is a link to its own directory (self -> .)
+  if (inside(root, target)) return symlink(relative(dirname(src), target) || ".", dst);
   if ((await stat(target).catch(() => null))?.isFile()) return copyFile(target, dst);
   await symlink(target, dst);
 }
 
 async function copyRepo(): Promise<string> {
   // Some sandboxes let mkdtemp "succeed" in a dir they then hide, so prove the copy is readable.
-  const dir = await mkdtemp(join(tmpRoot, "mutant-"))
-    .then(realpath)
+  const unusable = (e: unknown) => fail(`using a temp dir under ${tmpRoot} (pass a writable --tmp)`, e);
+  copyDir = await mkdtemp(join(tmpRoot, "mutant-")).catch(unusable);
+  const dir = await realpath(copyDir)
     .then(async (d) => (await Bun.write(join(d, ".probe"), "ok"), (await Bun.file(join(d, ".probe")).text()) === "ok" ? d : Promise.reject("not readable back")))
-    .catch((e) => fail(`using a temp dir under ${tmpRoot} (pass a writable --tmp)`, e));
-  copyDir = dir; // from here on an interrupt removes it
+    .catch(unusable);
   for (let i = 0; i < files.length; i += 64) await Promise.all(files.slice(i, i + 64).map((f) => copyEntry(dir, f)));
   await symlink(join(root, "node_modules"), join(dir, "node_modules")).catch(() => {});
   return dir;
@@ -182,7 +190,7 @@ async function run(m: Mutant, dir: string): Promise<Result> {
 }
 
 // One copy, mutants run one at a time.
-const dir = await copyRepo().catch((e) => (copyDir && rmSync(copyDir, { recursive: true, force: true }), fail("copying the repo", e)));
+const dir = await copyRepo().catch((e) => fail("copying the repo", e));
 const results: Result[] = [];
 let crashed: unknown;
 try {
@@ -200,7 +208,7 @@ try {
 } catch (e) {
   crashed = e;
 } finally {
-  await rm(dir, { recursive: true, force: true }).catch(() => {});
+  cleanup();
 }
 if (crashed) fail("running the tests", crashed);
 if (process.exitCode === 2) process.exit(2);

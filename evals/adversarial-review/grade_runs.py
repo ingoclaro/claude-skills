@@ -247,19 +247,27 @@ RULE_FIND = r"1023\.95|unit > 0|unit\+\+;\s*\}\s*return"
 
 def mutant_objects(text):
     """The mutant objects in a mutants file, or in a command that writes one."""
-    # The first JSON array of objects starting at any "[": a heredoc or echo
-    # around the JSON, or a `[ -d x ]` test before it, is skipped over.
+    # Every JSON array of objects, starting at any "[": a heredoc or echo
+    # around the JSON, a `[ -d x ]` test before it, or a second mutants file in
+    # the same command.
     decoder = json.JSONDecoder()
-    for m in re.finditer(r"\[", text or ""):
+    text = text or ""
+    arrays, pos = [], 0
+    while (start := text.find("[", pos)) != -1:
         try:
-            objs, _ = decoder.raw_decode(text, m.start())
+            objs, end = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
-            continue
+            objs, end = None, start + 1
         if isinstance(objs, list) and objs and all(isinstance(o, dict) for o in objs):
-            return objs
+            arrays += objs
+            pos = end
+        else:
+            pos = start + 1
+    if arrays:
+        return arrays
     # No array: the objects on their own, as an Edit that adds one has them.
     objs, pos = [], 0
-    while (start := (text or "").find("{", pos)) != -1:
+    while (start := text.find("{", pos)) != -1:
         try:
             obj, pos = decoder.raw_decode(text, start)
             if isinstance(obj, dict):
@@ -269,14 +277,21 @@ def mutant_objects(text):
     return objs
 
 
-def rule_mutants(run):
-    """Names of the mutants written for mutate.ts whose "find" is in the rollover rule.
+def rule_mutants_by_call(run):
+    """For each tool call, the rollover-rule mutants of the last mutate.ts run so far.
 
-    A mutants file written with Write is read as it stands after its last Edit;
-    an Edit to a file Write never made is read on its own, and Bash commands as
-    written.
+    A rule mutant is one whose "find" is in the rule. The mutants are read as
+    they stood when mutate.ts ran, so a mutants file rewritten for a rerun
+    doesn't lose a survivor from the first run, and a "find" edited off the
+    rule afterwards still counted for the run that used it. Files are followed
+    through Write and Edit; an Edit to a file Write never made is read on its
+    own, and Bash commands as written. Before any mutate.ts run, None.
     """
-    files, texts = {}, []
+    def names(texts):
+        return {m["name"] for t in texts for m in mutant_objects(t)
+                if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", "")))}
+
+    files, texts, current, by_call = {}, [], None, []
     for n, i, _ in run.tools:
         path = i.get("file_path")
         if n == "Write":
@@ -288,8 +303,10 @@ def rule_mutants(run):
             texts.append(i.get("new_string", ""))
         elif n == "Bash":
             texts.append(i.get("command", ""))
-    return {m["name"] for t in [*files.values(), *texts] for m in mutant_objects(t)
-            if isinstance(m.get("name"), str) and re.search(RULE_FIND, str(m.get("find", "")))}
+            if "mutate.ts" in i.get("command", ""):
+                current = names([*files.values(), *texts])
+        by_call.append(current)
+    return by_call
 
 
 def gap_proven(run):
@@ -297,9 +314,11 @@ def gap_proven(run):
     # commit's tests let through: the SURVIVED line must name that mutant, not
     # some other survivor. In the baseline that means doing the mutation by
     # hand: editing the rule and running the suite green.
-    rule = rule_mutants(run)
-    for c, o in run.bash_runs():
-        for line in o.splitlines():
+    by_call = rule_mutants_by_call(run)
+    for (n, i, _), t, rule in zip(run.tools, run.ids, by_call):
+        if n != "Bash" or not rule:
+            continue
+        for line in run.outputs.get(t, "").splitlines():
             m = re.match(r"SURVIVED\s+(.*)", line)
             if m and any(m.group(1).startswith(f"{name}:") for name in rule):
                 return True, line[:200]
@@ -316,7 +335,7 @@ def gap_proven(run):
             if re.search(r"\b0 fail\b", out):
                 return True, f"rule edited out by hand, then: {i['command'][:80]} -> {' '.join(out.split())[:80]}"
             edited = False
-    return False, ("no mutant on the rollover rule survived" if rule else "no mutant or edit touched the rollover rule")
+    return False, ("no mutant on the rollover rule survived" if any(by_call) else "no mutant or edit touched the rollover rule")
 
 
 def reports_test_gap(run):

@@ -253,3 +253,29 @@ test("a file the copy doesn't have is reported as missing, and a ..name is in th
   expect(out).toMatch(/NOT APPLIED\s+ignored: gen.ts is not in the copy/);
   expect(out).toMatch(/caught\s+dots/);
 });
+
+test("a link to its own directory is copied as one", async () => {
+  const dir = await repo(add);
+  await symlink(".", join(dir, "self"));
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm self`.cwd(dir);
+  // a path, so the runner doesn't walk self/self/...
+  const { code, out } = await mutate(dir, [{ name: "minus", file: "add.ts", find: "a + b", replace: "a - b" }], "bun test ./add.test.ts", ["--all"]);
+  expect(out).toMatch(/caught\s+minus/);
+  expect(code).toBe(0);
+});
+
+test("a link to a link out of the repo still points at its neighbour", async () => {
+  // a.ts -> b.ts -> outside: resolved all the way, a.ts would be its own copy
+  // and a mutant on b.ts would never reach the test.
+  const outside = await tempDir();
+  await Bun.write(join(outside, "impl.ts"), add["add.ts"]);
+  const dir = await repo({
+    "a.test.ts": 'import { test, expect } from "bun:test";\nimport { add } from "./a";\ntest("adds", () => expect(add(2, 3)).toBe(5));\n',
+  });
+  await symlink(join(outside, "impl.ts"), join(dir, "b.ts"));
+  await symlink("b.ts", join(dir, "a.ts"));
+  await $`git add -A && git -c user.name=t -c user.email=t@t commit -qm links`.cwd(dir);
+  const { out } = await mutate(dir, [{ name: "minus", file: "b.ts", find: "a + b", replace: "a - b" }], "bun test", ["--all"]);
+  expect(out).toMatch(/caught\s+minus/);
+  expect(await Bun.file(join(outside, "impl.ts")).text()).toBe(add["add.ts"]);
+});
